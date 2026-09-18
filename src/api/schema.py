@@ -1,7 +1,7 @@
 import time
 from typing import Iterable, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from api.setting import DEFAULT_MODEL
 
@@ -176,6 +176,136 @@ class ChatStreamResponse(BaseChatResponse):
     choices: list[ChoiceDelta]
     object: Literal["chat.completion.chunk"] = "chat.completion.chunk"
     usage: Usage | None = None
+
+
+class ResponsesReasoningConfig(BaseModel):
+    """The `reasoning` object of a Responses request."""
+
+    model_config = ConfigDict(extra="allow")
+
+    effort: str | None = None
+    summary: str | None = None
+    generate_summary: str | None = None  # Deprecated alias of summary.
+
+
+class ResponsesTextConfig(BaseModel):
+    """The `text` object of a Responses request. Only carried through for echoing back."""
+
+    model_config = ConfigDict(extra="allow")
+
+    format: dict | None = None
+    verbosity: str | None = None
+
+
+class ResponsesRequest(BaseModel):
+    """The subset of the OpenAI Responses API this gateway understands.
+
+    `input` items are kept as plain dicts on purpose: the Responses API accepts a dozen
+    item types whose shapes keep growing, and a strict union would reject a request over
+    a field that never reaches Bedrock anyway. Unknown top-level fields are allowed for
+    the same reason.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    model: str = DEFAULT_MODEL
+    input: str | list[dict] = ""
+    instructions: str | None = None
+    tools: list[dict] | None = None
+    tool_choice: str | dict | None = None
+    max_output_tokens: int | None = Field(default=None, ge=1)
+    temperature: float | None = Field(default=None, le=2.0, ge=0.0)
+    top_p: float | None = Field(default=None, le=1.0, ge=0.0)
+    stream: bool | None = False
+    reasoning: ResponsesReasoningConfig | None = None
+    text: ResponsesTextConfig | None = None
+    parallel_tool_calls: bool | None = True
+    previous_response_id: str | None = None  # Not used, this gateway is stateless.
+    store: bool | None = False  # Not used, nothing is persisted.
+    truncation: str | None = "disabled"  # Not used.
+    metadata: dict | None = None
+    include: list[str] | None = None  # Not used.
+    user: str | None = None  # Not used.
+    extra_body: dict | None = None
+
+
+class ResponsesOutputText(BaseModel):
+    type: Literal["output_text"] = "output_text"
+    text: str
+    annotations: list[dict] = []
+
+
+class ResponsesOutputMessage(BaseModel):
+    type: Literal["message"] = "message"
+    id: str
+    role: Literal["assistant"] = "assistant"
+    status: Literal["in_progress", "completed", "incomplete"] = "completed"
+    content: list[ResponsesOutputText] = []
+
+
+class ResponsesReasoningSummary(BaseModel):
+    type: Literal["summary_text"] = "summary_text"
+    text: str
+
+
+class ResponsesReasoningItem(BaseModel):
+    type: Literal["reasoning"] = "reasoning"
+    id: str
+    summary: list[ResponsesReasoningSummary] = []
+    status: Literal["in_progress", "completed", "incomplete"] | None = None
+
+
+class ResponsesFunctionCall(BaseModel):
+    type: Literal["function_call"] = "function_call"
+    id: str
+    call_id: str
+    name: str
+    arguments: str
+    status: Literal["in_progress", "completed", "incomplete"] = "completed"
+
+
+ResponsesOutputItem = ResponsesReasoningItem | ResponsesOutputMessage | ResponsesFunctionCall
+
+
+class ResponsesInputTokensDetails(BaseModel):
+    cached_tokens: int = 0
+
+
+class ResponsesOutputTokensDetails(BaseModel):
+    reasoning_tokens: int = 0
+
+
+class ResponsesUsage(BaseModel):
+    input_tokens: int
+    input_tokens_details: ResponsesInputTokensDetails = ResponsesInputTokensDetails()
+    output_tokens: int
+    output_tokens_details: ResponsesOutputTokensDetails = ResponsesOutputTokensDetails()
+    total_tokens: int
+
+
+class ResponsesResponse(BaseModel):
+    id: str
+    object: Literal["response"] = "response"
+    created_at: int = Field(default_factory=lambda: int(time.time()))
+    status: Literal["in_progress", "completed", "incomplete", "failed"] = "completed"
+    model: str
+    output: list[ResponsesOutputItem] = []
+    usage: ResponsesUsage | None = None
+    error: dict | None = None
+    incomplete_details: dict | None = None
+    instructions: str | None = None
+    max_output_tokens: int | None = None
+    parallel_tool_calls: bool = True
+    previous_response_id: str | None = None
+    reasoning: ResponsesReasoningConfig | None = None
+    store: bool = False
+    temperature: float | None = None
+    text: ResponsesTextConfig | None = None
+    tool_choice: str | dict = "auto"
+    tools: list[dict] = []
+    top_p: float | None = None
+    truncation: str = "disabled"
+    metadata: dict = {}
 
 
 class EmbeddingsRequest(BaseModel):

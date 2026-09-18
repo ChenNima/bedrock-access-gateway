@@ -99,6 +99,18 @@ TEMPERATURE_TOPP_CONFLICT_MODELS = {
     "claude-opus-4-5",
 }
 
+# Models that reject the `temperature` inference parameter entirely.
+# OpenAI reasoning models on Bedrock (GPT-6 / GPT-5.x) return a
+# ValidationException ("This model doesn't support the temperature field")
+# when temperature is supplied, so it is dropped before the Converse call.
+TEMPERATURE_UNSUPPORTED_MODELS = {
+    "openai.gpt-6",
+    "openai.gpt-5",
+}
+
+# Smallest reasoning budget Bedrock accepts today. It may differ per model in the future.
+MIN_BUDGET_TOKENS = 1024
+
 # Models that don't support assistant message prefill
 # For these models, if conversation ends with assistant message (e.g., "continue response"),
 # a user message will be added to ask the model to continue
@@ -368,6 +380,14 @@ class BedrockModel(BaseChatModel):
             logger.error("Bedrock invocation failed for model %s: %s", chat_request.model, str(e))
             raise HTTPException(status_code=500, detail=str(e))
         return response
+
+    async def invoke(self, chat_request: ChatRequest, stream: bool = False):
+        """Invoke Bedrock and hand back its raw Converse response.
+
+        The Responses API needs the untranslated blocks (reasoning, text and toolUse stay
+        separate items there), so it goes through this instead of chat()/chat_stream().
+        """
+        return await self._invoke_bedrock(chat_request, stream=stream)
 
     async def chat(self, chat_request: ChatRequest) -> ChatResponse:
         """Default implementation for Chat API."""
@@ -796,6 +816,15 @@ class BedrockModel(BaseChatModel):
         resolved_model = self._resolve_to_foundation_model(chat_request.model)
         model_lower = resolved_model.lower()
 
+        # Some models (OpenAI GPT-6 / GPT-5.x reasoning models) reject the
+        # temperature field outright. Drop it before calling Converse.
+        if "temperature" in inference_config and any(
+            unsupported in model_lower for unsupported in TEMPERATURE_UNSUPPORTED_MODELS
+        ):
+            inference_config.pop("temperature", None)
+            if DEBUG:
+                logger.info(f"Removed temperature for {chat_request.model} (not supported by model)")
+
         # Check if model is in the conflict list and both parameters are present
         if "temperature" in inference_config and "topP" in inference_config:
             if any(conflict_model in model_lower for conflict_model in TEMPERATURE_TOPP_CONFLICT_MODELS):
@@ -901,7 +930,12 @@ class BedrockModel(BaseChatModel):
         reasoning_text = ""
         for block in content:
             if "reasoningContent" in block:
-                reasoning_text += block["reasoningContent"]["reasoningText"].get("text", "")
+                # Claude exposes plaintext reasoning under `reasoningText`; OpenAI
+                # models (GPT-6 / GPT-5.x) return encrypted `redactedContent` with
+                # no plaintext to count. Guard against the missing key.
+                reasoning = block["reasoningContent"].get("reasoningText")
+                if reasoning:
+                    reasoning_text += reasoning.get("text", "")
 
         if reasoning_text:
             # Use tiktoken to estimate token count
@@ -945,9 +979,13 @@ class BedrockModel(BaseChatModel):
             message.content = ""
             for c in content:
                 if "reasoningContent" in c:
-                    message.reasoning_content = c["reasoningContent"][
-                        "reasoningText"
-                    ].get("text", "")
+                    # Claude returns plaintext reasoning under `reasoningText`;
+                    # OpenAI models (GPT-6 / GPT-5.x) return encrypted
+                    # `redactedContent` instead, which has no plaintext to
+                    # surface. Only expose reasoning when plaintext exists.
+                    reasoning = c["reasoningContent"].get("reasoningText")
+                    if reasoning:
+                        message.reasoning_content = reasoning.get("text", "")
                 elif "text" in c:
                     message.content = c["text"]
                 else:
@@ -1232,12 +1270,26 @@ class BedrockModel(BaseChatModel):
         # Ratio for efforts:  Low - 30%, medium - 60%, High: Max token - 1
         # Note that The minimum budget_tokens is 1,024 tokens so far.
         # But it may be changed for different models in the future.
+        if max_tokens <= MIN_BUDGET_TOKENS:
+            # No budget in that range is both under max_tokens and above the minimum.
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"max_tokens must be greater than {MIN_BUDGET_TOKENS} when using reasoning_effort, "
+                    f"got {max_tokens}"
+                ),
+            )
+
         if reasoning_effort == "low":
-            return int(max_tokens * 0.3)
+            budget_tokens = int(max_tokens * 0.3)
         elif reasoning_effort == "medium":
-            return int(max_tokens * 0.6)
+            budget_tokens = int(max_tokens * 0.6)
         else:
-            return max_tokens - 1
+            budget_tokens = max_tokens - 1
+
+        # A small max_tokens puts the low/medium ratio under the minimum, which Bedrock
+        # rejects outright, so lift it back to the floor.
+        return max(budget_tokens, MIN_BUDGET_TOKENS)
 
     def _convert_finish_reason(self, finish_reason: str | None) -> str | None:
         """

@@ -11,6 +11,7 @@ export OPENAI_BASE_URL=<API base url>
 
 **API 示例:**
 - [Models API](#models-api)
+- [Responses API](#responses-api)
 - [Embedding API](#embedding-api)
 - [Multimodal API](#multimodal-api)
 - [Tool Call](#tool-call)
@@ -85,6 +86,119 @@ completion = client.chat.completions.create(
 
 print(completion.choices[0].message.content)
 ```
+
+## Responses API
+
+除 `/chat/completions` 之外,代理还提供 `POST /responses`,即较新的
+[Responses API](https://platform.openai.com/docs/api-reference/responses)。只支持 Responses 协议的
+客户端(例如 Codex CLI)需要用它。
+
+### 基础示例
+
+```bash
+curl $OPENAI_BASE_URL/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -d '{
+    "model": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "instructions": "You are a helpful assistant.",
+    "input": "你好!"
+  }'
+```
+
+```python
+from openai import OpenAI
+
+client = OpenAI()
+response = client.responses.create(
+    model="us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    input="编写一个使用动态规划计算斐波那契数列的Python函数。",
+)
+
+print(response.output_text)
+```
+
+### 流式输出
+
+Bedrock 的每个 content block 会映射为一个 output item,因此思考过程、正文和工具调用是彼此独立的
+item,不会被压平进同一段文本:
+
+```python
+with client.responses.stream(
+    model="us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    input="17*23 等于多少?请一步步思考。",
+    reasoning={"effort": "low"},
+) as stream:
+    for event in stream:
+        if event.type == "response.reasoning_summary_text.delta":
+            print(event.delta, end="", flush=True)
+        elif event.type == "response.output_text.delta":
+            print(event.delta, end="", flush=True)
+```
+
+### 工具调用
+
+Responses API 的函数工具是平铺声明的;`function_call` 里的 `call_id` 就是你在对应的
+`function_call_output` 中要回传的 id:
+
+```python
+tools = [
+    {
+        "type": "function",
+        "name": "get_weather",
+        "description": "查询某个城市的天气",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+    }
+]
+
+history = [{"role": "user", "content": "巴黎天气怎么样?"}]
+response = client.responses.create(model=MODEL, input=history, tools=tools)
+
+call = next(item for item in response.output if item.type == "function_call")
+history += [item.model_dump() for item in response.output]
+history.append(
+    {
+        "type": "function_call_output",
+        "call_id": call.call_id,
+        "output": '{"temp_c": 18, "sky": "clear"}',
+    }
+)
+
+print(client.responses.create(model=MODEL, input=history, tools=tools).output_text)
+```
+
+### 配合 Codex CLI 使用
+
+在 `~/.codex/config.toml` 中增加一个 provider:
+
+```toml
+model = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+model_provider = "bedrock-gateway"
+
+[model_providers.bedrock-gateway]
+name = "Bedrock Access Gateway"
+base_url = "<API base url>"
+env_key = "BEDROCK_GATEWAY_API_KEY"
+wire_api = "responses"
+```
+
+关键是 `wire_api = "responses"`。把网关的 API Key 导出到 `BEDROCK_GATEWAY_API_KEY` 后直接运行
+`codex` 即可。Codex 会提示找不到该模型的 metadata,可以忽略。
+
+### 限制
+
+网关是无状态的,因此 `store` 和 `previous_response_id` 会被忽略——请像 Codex CLI 那样在 `input` 中
+带上完整对话。回传到 `input` 里的 reasoning item 会被丢弃,因为 Bedrock 只接受带原始 signature 的
+思考块,而 Responses 协议里没有这个字段。托管工具(`web_search`、`file_search` 等)以及 `namespace`
+工具组会被丢弃并记录警告日志,它们在 Bedrock 上没有对应实现;`tool_choice: "none"` 会退化为
+`"auto"`。
+
+当请求开启了 reasoning 但没给 `max_output_tokens` 时,网关必须补上 Bedrock 要求的 maxTokens,
+此时取 `DEFAULT_MAX_TOKENS`(默认 32768)。
 
 ## Embedding API
 

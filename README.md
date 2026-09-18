@@ -30,6 +30,7 @@ If you find this GitHub repository useful, please consider giving it a free star
 - [x] Support streaming response via server-sent events (SSE)
 - [x] Support Model APIs
 - [x] Support Chat Completion APIs
+- [x] Support Responses API, so the Codex CLI works against Bedrock (**new**)
 - [x] Support Tool Call
 - [x] Support Embedding API
 - [x] Support Multimodal API
@@ -191,6 +192,53 @@ print(completion.choices[0].message.content)
 ```
 
 Please check [Usage Guide](./docs/Usage.md) for more details about how to use embedding API, multimodal API and tool call.
+
+### Responses API and the Codex CLI
+
+`POST /responses` is served alongside `/chat/completions`, which is what clients built on the
+newer OpenAI [Responses API](https://platform.openai.com/docs/api-reference/responses) need —
+the Codex CLI among them, since it does not speak Chat Completions.
+
+```python
+from openai import OpenAI
+
+client = OpenAI()
+response = client.responses.create(
+    model="us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    instructions="You are a helpful assistant.",
+    input="Hello!",
+)
+
+print(response.output_text)
+```
+
+To point the Codex CLI at the gateway, add a provider to `~/.codex/config.toml`:
+
+```toml
+model = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+model_provider = "bedrock-gateway"
+
+[model_providers.bedrock-gateway]
+name = "Bedrock Access Gateway"
+base_url = "<API base url>"   # e.g. http://localhost:8000/api/v1
+env_key = "BEDROCK_GATEWAY_API_KEY"
+wire_api = "responses"
+```
+
+Then `export BEDROCK_GATEWAY_API_KEY=<API key>` and run `codex`. Shell commands, file edits and
+reasoning summaries all work; Codex will warn that it has no metadata for the model, which is
+harmless.
+
+What the translation covers and what it does not:
+
+| Responses feature | Behaviour |
+| --- | --- |
+| Text, image and function-call input items, streaming, function tools, reasoning | Translated to Bedrock Converse. |
+| `reasoning` | Emitted as reasoning items with summary text. Set `DEFAULT_MAX_TOKENS` if you need a budget other than 32,768 when a request omits `max_output_tokens`. |
+| `store`, `previous_response_id` | Ignored. The gateway is stateless, so send the full conversation in `input` (which is what the Codex CLI does). |
+| Input `reasoning` items | Dropped. Bedrock only accepts a reasoning block back with the signature it issued, and that signature has no place in the Responses wire format. |
+| Hosted tools (`web_search`, `file_search`, ...) and `namespace` tool groups | Dropped with a log warning, since they have no Bedrock counterpart. Codex's sub-agent tools arrive in a namespace group and are therefore unavailable. |
+| `tool_choice: "none"` | Falls back to `"auto"`; Bedrock's `toolChoice` has no equivalent. |
 
 ### Application Inference Profiles
 

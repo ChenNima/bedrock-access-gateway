@@ -11,6 +11,7 @@ export OPENAI_BASE_URL=<API base url>
 
 **API Example:**
 - [Models API](#models-api)
+- [Responses API](#responses-api)
 - [Embedding API](#embedding-api)
 - [Multimodal API](#multimodal-api)
 - [Tool Call](#tool-call)
@@ -87,6 +88,119 @@ completion = client.chat.completions.create(
 
 print(completion.choices[0].message.content)
 ```
+
+## Responses API
+
+`POST /responses` serves the newer [Responses API](https://platform.openai.com/docs/api-reference/responses)
+next to `/chat/completions`. Use it for clients that only speak Responses, such as the Codex CLI.
+
+### Basic Example
+
+```bash
+curl $OPENAI_BASE_URL/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -d '{
+    "model": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "instructions": "You are a helpful assistant.",
+    "input": "Hello!"
+  }'
+```
+
+```python
+from openai import OpenAI
+
+client = OpenAI()
+response = client.responses.create(
+    model="us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    input="Write a Python function to calculate the Fibonacci sequence using dynamic programming.",
+)
+
+print(response.output_text)
+```
+
+### Streaming
+
+Each Bedrock content block becomes one output item, so reasoning, text and tool calls arrive as
+separate items rather than being flattened into one text stream:
+
+```python
+with client.responses.stream(
+    model="us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    input="What is 17*23? Think it through.",
+    reasoning={"effort": "low"},
+) as stream:
+    for event in stream:
+        if event.type == "response.reasoning_summary_text.delta":
+            print(event.delta, end="", flush=True)
+        elif event.type == "response.output_text.delta":
+            print(event.delta, end="", flush=True)
+```
+
+### Tool Call
+
+Function tools are declared flat, as the Responses API expects, and the `call_id` of a
+`function_call` is the id you send back in the matching `function_call_output`:
+
+```python
+tools = [
+    {
+        "type": "function",
+        "name": "get_weather",
+        "description": "Get the weather for a city",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+    }
+]
+
+history = [{"role": "user", "content": "What is the weather in Paris?"}]
+response = client.responses.create(model=MODEL, input=history, tools=tools)
+
+call = next(item for item in response.output if item.type == "function_call")
+history += [item.model_dump() for item in response.output]
+history.append(
+    {
+        "type": "function_call_output",
+        "call_id": call.call_id,
+        "output": '{"temp_c": 18, "sky": "clear"}',
+    }
+)
+
+print(client.responses.create(model=MODEL, input=history, tools=tools).output_text)
+```
+
+### Using the Codex CLI
+
+Add a provider to `~/.codex/config.toml`:
+
+```toml
+model = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+model_provider = "bedrock-gateway"
+
+[model_providers.bedrock-gateway]
+name = "Bedrock Access Gateway"
+base_url = "<API base url>"
+env_key = "BEDROCK_GATEWAY_API_KEY"
+wire_api = "responses"
+```
+
+`wire_api = "responses"` is the important part. Export `BEDROCK_GATEWAY_API_KEY` with your gateway
+API key and run `codex`. Codex will warn that it has no metadata for the model, which is harmless.
+
+### Limitations
+
+The gateway is stateless, so `store` and `previous_response_id` are ignored — send the whole
+conversation in `input`, which is what the Codex CLI does. Reasoning items you send back in
+`input` are dropped, because Bedrock only accepts a reasoning block together with the signature it
+issued and that signature has no place in the Responses wire format. Hosted tools
+(`web_search`, `file_search`, ...) and `namespace` tool groups are dropped with a log warning,
+having no Bedrock counterpart, and `tool_choice: "none"` falls back to `"auto"`.
+
+When a request enables reasoning without `max_output_tokens`, the gateway has to supply the
+maxTokens that Bedrock requires; it uses `DEFAULT_MAX_TOKENS` (32,768 by default).
 
 ## Embedding API
 

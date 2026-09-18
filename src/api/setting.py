@@ -16,6 +16,10 @@ DEFAULT_EMBEDDING_MODEL = os.environ.get("DEFAULT_EMBEDDING_MODEL", "cohere.embe
 ENABLE_CROSS_REGION_INFERENCE = os.environ.get("ENABLE_CROSS_REGION_INFERENCE", "true").lower() != "false"
 ENABLE_APPLICATION_INFERENCE_PROFILES = os.environ.get("ENABLE_APPLICATION_INFERENCE_PROFILES", "true").lower() != "false"
 ENABLE_PROMPT_CACHING = os.environ.get("ENABLE_PROMPT_CACHING", "false").lower() != "false"
+# The Responses API makes max_output_tokens optional, but Bedrock rejects a Claude request
+# that enables reasoning without an explicit maxTokens. Used only as that fallback, so it
+# must stay within the output limit of whichever reasoning model you point the gateway at.
+DEFAULT_MAX_TOKENS = int(os.environ.get("DEFAULT_MAX_TOKENS", "32768"))
 
 # Multimodal image inputs may reference a remote URL that the gateway fetches on
 # behalf of the caller. See api/image_url.py for the checks applied to that URL.
