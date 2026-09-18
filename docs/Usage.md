@@ -190,6 +190,25 @@ wire_api = "responses"
 `wire_api = "responses"` is the important part. Export `BEDROCK_GATEWAY_API_KEY` with your gateway
 API key and run `codex`. Codex will warn that it has no metadata for the model, which is harmless.
 
+OpenAI reasoning models on Bedrock work too. Point `model` at their inference-profile ID and,
+optionally, set `model_reasoning_effort`:
+
+```toml
+model = "global.openai.gpt-6-astra"
+model_provider = "bedrock-gateway"
+model_reasoning_effort = "medium"
+
+[model_providers.bedrock-gateway]
+name = "Bedrock Access Gateway"
+base_url = "<API base url>"
+env_key = "BEDROCK_GATEWAY_API_KEY"
+wire_api = "responses"
+```
+
+GPT-6 / GPT-5.x reject the `temperature` field and return encrypted `redactedContent` instead of
+plaintext reasoning; the gateway drops `temperature` for them and skips the encrypted block, so
+no extra configuration is required.
+
 ### Limitations
 
 The gateway is stateless, so `store` and `previous_response_id` are ignored — send the whole

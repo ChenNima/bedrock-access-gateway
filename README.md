@@ -229,6 +229,26 @@ Then `export BEDROCK_GATEWAY_API_KEY=<API key>` and run `codex`. Shell commands,
 reasoning summaries all work; Codex will warn that it has no metadata for the model, which is
 harmless.
 
+OpenAI reasoning models on Bedrock work as well — set `model` to their inference-profile ID, e.g.
+`global.openai.gpt-6-astra` or `global.openai.gpt-5.6-sol`, and optionally add
+`model_reasoning_effort = "low" | "medium" | "high"`:
+
+```toml
+model = "global.openai.gpt-6-astra"
+model_provider = "bedrock-gateway"
+model_reasoning_effort = "medium"
+
+[model_providers.bedrock-gateway]
+name = "Bedrock Access Gateway"
+base_url = "<API base url>"
+env_key = "BEDROCK_GATEWAY_API_KEY"
+wire_api = "responses"
+```
+
+These models reject the `temperature` field and return their reasoning as encrypted
+`redactedContent` rather than plaintext; the gateway drops `temperature` for them and skips the
+encrypted block, so no extra configuration is needed.
+
 What the translation covers and what it does not:
 
 | Responses feature | Behaviour |

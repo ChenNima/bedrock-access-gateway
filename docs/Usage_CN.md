@@ -189,6 +189,24 @@ wire_api = "responses"
 关键是 `wire_api = "responses"`。把网关的 API Key 导出到 `BEDROCK_GATEWAY_API_KEY` 后直接运行
 `codex` 即可。Codex 会提示找不到该模型的 metadata,可以忽略。
 
+Bedrock 上的 OpenAI 推理模型同样可用。把 `model` 指向它们的推理配置(inference profile)ID,
+并按需设置 `model_reasoning_effort`:
+
+```toml
+model = "global.openai.gpt-6-astra"
+model_provider = "bedrock-gateway"
+model_reasoning_effort = "medium"
+
+[model_providers.bedrock-gateway]
+name = "Bedrock Access Gateway"
+base_url = "<API base url>"
+env_key = "BEDROCK_GATEWAY_API_KEY"
+wire_api = "responses"
+```
+
+GPT-6 / GPT-5.x 不接受 `temperature` 字段,且返回的是加密的 `redactedContent` 而非明文思考内容;
+网关会自动为这些模型丢弃 `temperature` 并跳过加密块,无需额外配置。
+
 ### 限制
 
 网关是无状态的,因此 `store` 和 `previous_response_id` 会被忽略——请像 Codex CLI 那样在 `input` 中
