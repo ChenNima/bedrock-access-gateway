@@ -12,6 +12,7 @@ export OPENAI_BASE_URL=<API base url>
 **API 示例:**
 - [Models API](#models-api)
 - [Responses API](#responses-api)
+- [Anthropic Messages API](#anthropic-messages-api)
 - [Embedding API](#embedding-api)
 - [Multimodal API](#multimodal-api)
 - [Tool Call](#tool-call)
@@ -217,6 +218,85 @@ GPT-6 / GPT-5.x 不接受 `temperature` 字段,且返回的是加密的 `redacte
 
 当请求开启了 reasoning 但没给 `max_output_tokens` 时,网关必须补上 Bedrock 要求的 maxTokens,
 此时取 `DEFAULT_MAX_TOKENS`(默认 32768)。
+
+## Anthropic Messages API
+
+`POST /messages` 提供 [Anthropic Messages API](https://docs.anthropic.com/en/api/messages)，
+`POST /messages/count_tokens` 提供对应的 token 计数接口，供使用 Anthropic 格式的客户端调用，
+例如 Anthropic SDK 和 Claude Code。API Key 可以通过 `x-api-key` 或 `Authorization: Bearer` 传入。
+
+Anthropic 客户端会在 base URL 后自动拼接 `/v1/messages`，因此 base URL 应为网关根路径、不带末尾的
+`/v1`（例如 `http://localhost:8000/api`）。如果修改了 `API_ROUTE_PREFIX`，请保证它仍以 `/v1` 结尾。
+
+### 基础示例
+
+```bash
+curl $ANTHROPIC_BASE_URL/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -d '{
+    "model": "claude-haiku-4-5",
+    "max_tokens": 1024,
+    "system": "You are a helpful assistant.",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic()  # 读取 ANTHROPIC_BASE_URL 和 ANTHROPIC_API_KEY
+message = client.messages.create(
+    model="claude-sonnet-4-5",
+    max_tokens=4096,
+    thinking={"type": "enabled", "budget_tokens": 2048},
+    messages=[{"role": "user", "content": "What is 17*23?"}],
+)
+
+for block in message.content:
+    print(block.type, getattr(block, "thinking", None) or getattr(block, "text", ""))
+```
+
+`model` 可以是 Bedrock 模型 ID 或推理配置文件，也可以是 `claude-sonnet-4-5` / `claude-opus-4-6`
+这样的官方名称，网关会将其映射到对应的 Bedrock 推理配置文件（优先 global，其次区域级）。
+工具调用、图片、PDF、流式输出、extended / adaptive thinking 以及 `cache_control` 的行为与
+Anthropic API 一致。
+
+### 配合 Claude Code 使用
+
+```bash
+export ANTHROPIC_BASE_URL=<不带 /v1 的 API base url>   # 例如 http://localhost:8000/api
+export ANTHROPIC_API_KEY=<API key>
+claude
+```
+
+请确保没有设置 `CLAUDE_CODE_USE_BEDROCK`，否则 Claude Code 会直接调用 Bedrock 而不经过网关。
+Claude Code 默认的模型名称无需修改即可使用。如需使用其他 Bedrock 模型（包括非 Claude 模型）：
+
+```bash
+export ANTHROPIC_MODEL=global.openai.gpt-6-luna            # 或 qwen.qwen3-coder-480b-a35b-v1:0 等
+export ANTHROPIC_SMALL_FAST_MODEL=global.anthropic.claude-haiku-4-5-20251001-v1:0
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000                 # 模型输出上限低于 32k 时设置
+```
+
+对于非 Claude 模型 ID，Claude Code 会提示它不在模型目录中，这个提示可以忽略；但建议将
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` 设为模型真实的上下文窗口，使自动压缩在正确的时机触发。
+
+### 限制
+
+- Claude 专有的请求字段（`thinking`、`output_config`、`context_management`、`top_k`）会透传给
+  Claude，对其他模型则忽略。
+- `anthropic-beta` 中只有 `ANTHROPIC_BETA_ALLOWLIST` 列出的 flag 会被转发，因为 Bedrock 遇到不认识的
+  flag 会拒绝整个请求。默认值涵盖 interleaved thinking、1M 上下文、context management、effort
+  和 fine-grained tool streaming。
+- 服务端工具（`web_search`、`web_fetch`、`code_execution` 等）会被忽略并记录警告，因此 Claude Code
+  的 WebSearch 工具不会返回结果。不支持 citations。
+- `tool_result` 中的图片（Claude Code 传递截图和读取图片的方式）会原样传给 Claude；其他视觉模型
+  在 Bedrock 上只接受 tool result 之外的图片，网关会将图片移到该 tool result 之后。纯文本模型
+  收到图片会返回 400。
+- 没有签名的 thinking 块（例如 DeepSeek、Qwen 的输出）不会回传给 Bedrock。
+- `tool_choice: {"type": "none"}` 会回退为 `auto`。
+- `count_tokens` 在模型支持时使用 Bedrock CountTokens，否则使用 tiktoken 估算。
 
 ## Embedding API
 

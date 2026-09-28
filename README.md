@@ -31,6 +31,7 @@ If you find this GitHub repository useful, please consider giving it a free star
 - [x] Support Model APIs
 - [x] Support Chat Completion APIs
 - [x] Support Responses API, so the Codex CLI works against Bedrock (**new**)
+- [x] Support Anthropic Messages API, so Claude Code works against Bedrock (**new**)
 - [x] Support Tool Call
 - [x] Support Embedding API
 - [x] Support Multimodal API
@@ -259,6 +260,50 @@ What the translation covers and what it does not:
 | Input `reasoning` items | Dropped. Bedrock only accepts a reasoning block back with the signature it issued, and that signature has no place in the Responses wire format. |
 | Hosted tools (`web_search`, `file_search`, ...) and `namespace` tool groups | Dropped with a log warning, since they have no Bedrock counterpart. Codex's sub-agent tools arrive in a namespace group and are therefore unavailable. |
 | `tool_choice: "none"` | Falls back to `"auto"`; Bedrock's `toolChoice` has no equivalent. |
+
+### Anthropic Messages API and Claude Code
+
+`POST /messages` (plus `POST /messages/count_tokens`) speaks the
+[Anthropic Messages API](https://docs.anthropic.com/en/api/messages), so the Anthropic SDKs and
+Claude Code can use the gateway. It accepts the API key as `x-api-key` or as a bearer token.
+
+Point Claude Code at the gateway root — the part before `/v1`, since Claude Code appends
+`/v1/messages` itself:
+
+```bash
+export ANTHROPIC_BASE_URL=<API base url without /v1>   # e.g. http://localhost:8000/api
+export ANTHROPIC_API_KEY=<API key>
+claude
+```
+
+First-party model names such as `claude-sonnet-4-5` or `claude-opus-4-6` are mapped onto the
+matching Bedrock inference profile (global first, then regional), so Claude Code works with its
+defaults. You can also pick any Bedrock model, including non-Claude ones:
+
+```bash
+export ANTHROPIC_MODEL=global.openai.gpt-6-luna            # or qwen.qwen3-coder-480b-a35b-v1:0, ...
+export ANTHROPIC_SMALL_FAST_MODEL=global.anthropic.claude-haiku-4-5-20251001-v1:0
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000                 # if the model's output limit is below 32k
+```
+
+Claude Code prints a warning that a non-Claude model id is not in its model catalog; that is
+harmless, but set `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the model's real context window so
+auto-compact kicks in at the right point.
+
+What the translation covers and what it does not:
+
+| Messages feature | Behaviour |
+| --- | --- |
+| Text, image, PDF/text document, `tool_use` / `tool_result` blocks, streaming, custom tools | Translated to Bedrock Converse. |
+| `thinking` / `redacted_thinking` blocks | Kept with their signatures, so extended and interleaved thinking survive tool-use turns. Unsigned thinking (e.g. from DeepSeek or Qwen) is not sent back. |
+| `cache_control` | Becomes a Converse `cachePoint` (including `ttl`) on models that support prompt caching; ignored elsewhere. |
+| `thinking`, `output_config`, `context_management`, `top_k` | Passed to Claude as is; dropped for other models. |
+| `anthropic-beta` header | Only the flags Bedrock accepts are forwarded to Claude (see `ANTHROPIC_BETA_ALLOWLIST`); the rest are dropped, since Bedrock rejects a whole request over one unknown flag. |
+| Images (vision) | Kept for models with image input. Claude receives images inside `tool_result` as is; for other vision models (GPT, Qwen-VL, ...), which Bedrock only lets take images outside a tool result, they are moved right after it, so Claude Code screenshots and image reads still work. Text-only models get a 400. |
+| Mid-conversation `system` messages | Folded into the adjacent user turn as text. |
+| Server tools (`web_search`, `web_fetch`, `code_execution`, ...) | Dropped with a log warning, so Claude Code's WebSearch returns no results. |
+| `tool_choice: {"type": "none"}` | Falls back to `auto`; Bedrock's `toolChoice` has no equivalent. |
+| `count_tokens` | Uses Bedrock CountTokens where the model supports it and a tiktoken estimate otherwise. |
 
 ### Application Inference Profiles
 

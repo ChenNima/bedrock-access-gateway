@@ -231,27 +231,31 @@ class BedrockModel(BaseChatModel):
 
     def validate(self, chat_request: ChatRequest):
         """Perform basic validation on requests"""
+        self.validate_model(chat_request.model)
+
+    def validate_model(self, model_id: str):
+        """Raise a 400 unless model_id is a model or inference profile this gateway can call."""
         error = ""
         # check if model is supported
-        if chat_request.model not in bedrock_model_list.keys():
+        if model_id not in bedrock_model_list.keys():
             # Provide helpful error for application profiles
-            if "application-inference-profile" in chat_request.model:
+            if "application-inference-profile" in model_id:
                 error = (
-                    f"Application profile {chat_request.model} not found. "
+                    f"Application profile {model_id} not found. "
                     f"Available profiles can be listed via GET /models API. "
                     f"Ensure ENABLE_APPLICATION_INFERENCE_PROFILES=true and "
                     f"the profile exists in your AWS account."
                 )
             else:
-                error = f"Unsupported model {chat_request.model}, please use models API to get a list of supported models"
-            logger.error("Unsupported model: %s", chat_request.model)
+                error = f"Unsupported model {model_id}, please use models API to get a list of supported models"
+            logger.error("Unsupported model: %s", model_id)
 
         # Validate profile has resolvable underlying model
-        if not error and chat_request.model in profile_metadata:
-            resolved = self._resolve_to_foundation_model(chat_request.model)
-            if resolved == chat_request.model:
+        if not error and model_id in profile_metadata:
+            resolved = self._resolve_to_foundation_model(model_id)
+            if resolved == model_id:
                 logger.warning(
-                    f"Could not resolve profile {chat_request.model} "
+                    f"Could not resolve profile {model_id} "
                     f"to underlying model. Some features may not work correctly."
                 )
 
@@ -360,7 +364,10 @@ class BedrockModel(BaseChatModel):
         args = self._parse_request(chat_request)
         if DEBUG:
             logger.info("Bedrock request: " + json.dumps(str(args)))
+        return await self.converse(args, stream=stream)
 
+    async def converse(self, args: dict, stream: bool = False):
+        """Call Converse (or ConverseStream) with ready-made arguments, mapping errors to HTTP."""
         try:
             if stream:
                 # Run the blocking boto3 call in a thread pool
@@ -371,13 +378,13 @@ class BedrockModel(BaseChatModel):
                 # Run the blocking boto3 call in a thread pool
                 response = await run_in_threadpool(bedrock_runtime.converse, **args)
         except bedrock_runtime.exceptions.ValidationException as e:
-            logger.error("Bedrock validation error for model %s: %s", chat_request.model, str(e))
+            logger.error("Bedrock validation error for model %s: %s", args.get("modelId"), str(e))
             raise HTTPException(status_code=400, detail=str(e))
         except bedrock_runtime.exceptions.ThrottlingException as e:
-            logger.warning("Bedrock throttling for model %s: %s", chat_request.model, str(e))
+            logger.warning("Bedrock throttling for model %s: %s", args.get("modelId"), str(e))
             raise HTTPException(status_code=429, detail=str(e))
         except Exception as e:
-            logger.error("Bedrock invocation failed for model %s: %s", chat_request.model, str(e))
+            logger.error("Bedrock invocation failed for model %s: %s", args.get("modelId"), str(e))
             raise HTTPException(status_code=500, detail=str(e))
         return response
 

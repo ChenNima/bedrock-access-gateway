@@ -308,6 +308,58 @@ class ResponsesResponse(BaseModel):
     metadata: dict = {}
 
 
+class AnthropicCountTokensRequest(BaseModel):
+    """The Anthropic Messages API request, minus the generation-only fields.
+
+    Messages, content blocks and tools stay plain dicts for the same reason as the
+    Responses input items: the block types keep growing, and most of their fields never
+    reach Bedrock. Unknown top-level fields are allowed too.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    model: str
+    messages: list[dict]
+    system: str | list[dict] | None = None
+    tools: list[dict] | None = None
+    tool_choice: dict | None = None
+    thinking: dict | None = None
+
+
+class AnthropicMessagesRequest(AnthropicCountTokensRequest):
+    max_tokens: int = Field(ge=1)
+    stop_sequences: list[str] | None = None
+    stream: bool | None = False
+    temperature: float | None = Field(default=None, le=1.0, ge=0.0)
+    top_p: float | None = Field(default=None, le=1.0, ge=0.0)
+    top_k: int | None = Field(default=None, ge=0)
+    output_config: dict | None = None
+    context_management: dict | None = None
+    metadata: dict | None = None  # Not used.
+
+
+class AnthropicUsage(BaseModel):
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
+
+
+class AnthropicMessagesResponse(BaseModel):
+    id: str
+    type: Literal["message"] = "message"
+    role: Literal["assistant"] = "assistant"
+    model: str
+    content: list[dict] = []
+    stop_reason: str | None = None
+    stop_sequence: str | None = None
+    usage: AnthropicUsage = AnthropicUsage()
+
+
+class AnthropicCountTokensResponse(BaseModel):
+    input_tokens: int
+
+
 class EmbeddingsRequest(BaseModel):
     input: str | list[str] | Iterable[int | Iterable[int]]
     model: str

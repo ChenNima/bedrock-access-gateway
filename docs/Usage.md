@@ -12,6 +12,7 @@ export OPENAI_BASE_URL=<API base url>
 **API Example:**
 - [Models API](#models-api)
 - [Responses API](#responses-api)
+- [Anthropic Messages API](#anthropic-messages-api)
 - [Embedding API](#embedding-api)
 - [Multimodal API](#multimodal-api)
 - [Tool Call](#tool-call)
@@ -220,6 +221,90 @@ having no Bedrock counterpart, and `tool_choice: "none"` falls back to `"auto"`.
 
 When a request enables reasoning without `max_output_tokens`, the gateway has to supply the
 maxTokens that Bedrock requires; it uses `DEFAULT_MAX_TOKENS` (32,768 by default).
+
+## Anthropic Messages API
+
+`POST /messages` serves the [Anthropic Messages API](https://docs.anthropic.com/en/api/messages)
+and `POST /messages/count_tokens` its token counting endpoint. Use them for clients that speak
+the Anthropic format, such as the Anthropic SDKs and Claude Code. The API key is accepted as
+`x-api-key` or as `Authorization: Bearer`.
+
+Anthropic clients append `/v1/messages` to their base URL, so their base URL is the gateway root
+without the trailing `/v1` (e.g. `http://localhost:8000/api`). If you change `API_ROUTE_PREFIX`,
+keep it ending in `/v1`.
+
+### Basic Example
+
+```bash
+curl $ANTHROPIC_BASE_URL/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -d '{
+    "model": "claude-haiku-4-5",
+    "max_tokens": 1024,
+    "system": "You are a helpful assistant.",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic()  # reads ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY
+message = client.messages.create(
+    model="claude-sonnet-4-5",
+    max_tokens=4096,
+    thinking={"type": "enabled", "budget_tokens": 2048},
+    messages=[{"role": "user", "content": "What is 17*23?"}],
+)
+
+for block in message.content:
+    print(block.type, getattr(block, "thinking", None) or getattr(block, "text", ""))
+```
+
+`model` can be a Bedrock model ID or inference profile, or a first-party name such as
+`claude-sonnet-4-5` / `claude-opus-4-6`, which is mapped onto the matching Bedrock inference
+profile (global first, then regional). Tool use, images, PDFs, streaming, extended and adaptive
+thinking and `cache_control` work as they do on the Anthropic API.
+
+### Using Claude Code
+
+```bash
+export ANTHROPIC_BASE_URL=<API base url without /v1>   # e.g. http://localhost:8000/api
+export ANTHROPIC_API_KEY=<API key>
+claude
+```
+
+Make sure `CLAUDE_CODE_USE_BEDROCK` is not set, otherwise Claude Code calls Bedrock directly
+instead of the gateway. Claude Code's default model names work unchanged. To use another
+Bedrock model, including non-Claude ones:
+
+```bash
+export ANTHROPIC_MODEL=global.openai.gpt-6-luna            # or qwen.qwen3-coder-480b-a35b-v1:0, ...
+export ANTHROPIC_SMALL_FAST_MODEL=global.anthropic.claude-haiku-4-5-20251001-v1:0
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000                 # if the model's output limit is below 32k
+```
+
+Claude Code warns that a non-Claude model ID is not in its model catalog. The warning is harmless,
+but set `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the model's real context window so auto-compact
+triggers at the right time.
+
+### Limitations
+
+- Claude-only request fields (`thinking`, `output_config`, `context_management`, `top_k`) are
+  passed to Claude and dropped for other models.
+- Of the `anthropic-beta` flags, only those listed in `ANTHROPIC_BETA_ALLOWLIST` are forwarded,
+  because Bedrock rejects a whole request over a flag it does not know. The default covers
+  interleaved thinking, 1M context, context management, effort and fine-grained tool streaming.
+- Server tools (`web_search`, `web_fetch`, `code_execution`, ...) are dropped with a log warning,
+  so Claude Code's WebSearch tool returns nothing. Citations are not supported.
+- Images inside a `tool_result` (how Claude Code passes screenshots and images it reads) go to
+  Claude as is. Other vision models on Bedrock only accept images outside a tool result, so for
+  them the gateway moves the images right after it. Text-only models reject images with a 400.
+- Unsigned thinking blocks (from models such as DeepSeek or Qwen) are not sent back to Bedrock.
+- `tool_choice: {"type": "none"}` falls back to `auto`.
+- `count_tokens` uses Bedrock CountTokens where the model supports it and a tiktoken estimate
+  otherwise.
 
 ## Embedding API
 

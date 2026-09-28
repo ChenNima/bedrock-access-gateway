@@ -30,3 +30,16 @@ IMAGE_URL_ALLOWED_HOSTS = frozenset(
     host.strip().lower() for host in os.environ.get("IMAGE_URL_ALLOWED_HOSTS", "").split(",") if host.strip()
 )
 IMAGE_URL_MAX_SIZE_MB = int(os.environ.get("IMAGE_URL_MAX_SIZE_MB", "10"))
+
+# Beta flags from the anthropic-beta header that the Messages API forwards to Claude.
+# Bedrock rejects a whole request over a flag it does not know, and Claude Code sends
+# several that only exist on the first-party API, so anything not listed is dropped.
+ANTHROPIC_BETA_ALLOWLIST = frozenset(
+    beta.strip()
+    for beta in os.environ.get(
+        "ANTHROPIC_BETA_ALLOWLIST",
+        "interleaved-thinking-2025-05-14,context-1m-2025-08-07,context-management-2025-06-27,"
+        "effort-2025-11-24,fine-grained-tool-streaming-2025-05-14,token-efficient-tools-2025-02-19",
+    ).split(",")
+    if beta.strip()
+)

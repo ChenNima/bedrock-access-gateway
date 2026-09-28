@@ -5,7 +5,7 @@ from typing import Annotated
 import boto3
 from botocore.exceptions import ClientError
 from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 
 api_key_param = os.environ.get("API_KEY_PARAM_NAME")
 api_key_secret_arn = os.environ.get("API_KEY_SECRET_ARN")
@@ -40,4 +40,19 @@ def api_key_auth(
     credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)],
 ):
     if credentials.credentials != api_key:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API Key")
+
+
+# Anthropic clients send the key as x-api-key (ANTHROPIC_API_KEY) or as a bearer token
+# (ANTHROPIC_AUTH_TOKEN), so the Messages API accepts either.
+x_api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
+optional_bearer = HTTPBearer(auto_error=False)
+
+
+def anthropic_api_key_auth(
+    x_api_key: Annotated[str | None, Depends(x_api_key_header)],
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(optional_bearer)],
+):
+    key = x_api_key or (credentials.credentials if credentials else None)
+    if key != api_key:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API Key")
