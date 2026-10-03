@@ -205,16 +205,69 @@ env_key = "BEDROCK_GATEWAY_API_KEY"
 wire_api = "responses"
 ```
 
-GPT-6 / GPT-5.x 不接受 `temperature` 字段,且返回的是加密的 `redactedContent` 而非明文思考内容;
-网关会自动为这些模型丢弃 `temperature` 并跳过加密块,无需额外配置。
+这些模型走下文介绍的原生直通,Codex 的 MCP namespace、`tool_search` 和 custom 工具都会原样到达模型。
+
+要确认 Codex 确实通过网关调用了 MCP 工具,不能只看 HTTP 200 或 Codex 是否列出了工具:工具被丢弃时
+同样会返回 200。请执行一个需要调用某个 MCP 工具的提示词,然后打开会话 rollout
+(`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`),查找 `item_completed` 事件:其 item 应为
+`"type":"McpToolCall"`,`server` 和 `tool` 符合预期,且 `"status":"completed"`。App Server 客户端
+收到的是同一个 item,名称为 `mcpToolCall`。
+
+### OpenAI GPT 模型的原生直通
+
+Bedrock 在 `bedrock-runtime` 上通过自己的
+[Responses API](https://docs.aws.amazon.com/bedrock/latest/userguide/inference-responses-api.html)
+提供 OpenAI GPT 模型,所以网关不会把这些请求转换成 Converse,而是原样转发。模型 id 匹配
+`*openai.gpt-*` 且不匹配 `*gpt-oss*` 时适用此规则;匹配在 `gpt-*` → `DEFAULT_MODEL` 别名替换之后
+进行。请求会被发往 `https://bedrock-runtime.<AWS_REGION>.amazonaws.com/openai/v1/responses`,并用网关
+自身的 AWS 凭证做 SigV4 签名。网关 API Key 照常校验,且不会被转发。流式事件逐字节转发,上游错误保留
+原状态码和响应体。
+
+| 环境变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `RESPONSES_NATIVE_MODEL_PATTERNS` | `*openai.gpt-*` | 需要直通的模型 id glob 模式,逗号分隔,不区分大小写。设为空值即关闭直通。 |
+| `RESPONSES_NATIVE_EXCLUDE_PATTERNS` | `*gpt-oss*` | 匹配这些模式的模型 id 仍走 Converse。 |
+| `BEDROCK_RUNTIME_RESPONSES_URL` | `https://bedrock-runtime.<AWS_REGION>.amazonaws.com/openai/v1/responses` | 覆盖上游 URL。 |
+
+- **store。** 客户端没有设置 `store` 时,网关会发送 `store: false`,Bedrock 不保留任何对话数据。
+  客户端显式传 `store: true` 时按其设置,此时 `previous_response_id` 可用。网关只代理
+  `POST /responses`,因此无法通过网关读取已存储的 response。
+- **IAM。** Bedrock 会对推理配置和账号的默认 project(`arn:aws:bedrock:*:<account>:project/default`)
+  同时校验 `bedrock:InvokeModel`(或 `InvokeModelWithResponseStream`)。两个 CloudFormation 模板都已
+  授予该权限;如果使用自己的角色,需要自行添加。
+- **端点限制。** 模型需填写 `us.` / `global.`(或 `us-gov.`)跨区域推理配置。基础模型 id 和
+  application inference profile 会被拒绝,`background: true` 也会被拒绝。`web_search` 等托管工具
+  不可用,Guardrails 也不生效。GPT OSS 模型在 `bedrock-runtime` 上不支持 Responses,因此被排除,
+  继续走 Converse。
+
+如果关闭直通,GPT-6 / GPT-5.x 会走 Converse。它们不接受 `temperature` 字段,且返回的是加密的
+`redactedContent` 而非明文思考内容,因此网关会为它们丢弃 `temperature` 并跳过加密块。
+
+### Converse 路径上的工具
+
+其他模型走 Converse 转换,Codex 用到的工具协议都会被转换:
+
+- **namespace 工具组**(Codex 以这种方式发送 MCP 工具)。每个成员会变成名为 `<namespace>__<name>` 的
+  Bedrock 工具。如果该名称非法、超过 64 个字符或已被占用,会被清洗、截断并加上短哈希。映射在每个请求中
+  重新计算,因此回放历史时会得到相同的名称。无论流式还是非流式,调用都以 `function_call` item 返回,
+  并带上原始的 `namespace` 和 `name`。`defer_loading` 会被忽略,延迟加载的工具会直接提供给模型。
+- **tool_choice。** `"required"` 映射为 Bedrock 的 `any`。指定的函数(可带 `namespace`)或 custom 工具
+  映射为 Bedrock 的 `tool`。如果没有可强制调用的工具,或指定的工具没有声明,网关会在调用 Bedrock 之前
+  返回 400:`{"error": {"type": "invalid_request_error", "param": "tool_choice", ...}}`。
+- **`execution: "client"` 的 tool_search** 会作为一个函数提供给模型,模型的调用以 `tool_search_call`
+  item 返回。之后的请求回放 `tool_search_output` 时,其中列出的工具会加入该请求。
+- **additional_tools** 输入 item 中的工具会加入请求的工具列表。
+- **custom 工具**(例如 Codex 基于语法的 `exec`)会以只有一个字符串参数 `input` 的函数发送,调用以
+  `custom_tool_call` item 返回。语法会写进工具描述,因为 Bedrock 无法强制执行。
 
 ### 限制
 
-网关是无状态的,因此 `store` 和 `previous_response_id` 会被忽略——请像 Codex CLI 那样在 `input` 中
-带上完整对话。回传到 `input` 里的 reasoning item 会被丢弃,因为 Bedrock 只接受带原始 signature 的
-思考块,而 Responses 协议里没有这个字段。托管工具(`web_search`、`file_search` 等)以及 `namespace`
-工具组会被丢弃并记录警告日志,它们在 Bedrock 上没有对应实现;`tool_choice: "none"` 会退化为
-`"auto"`。
+以下限制针对 Converse 路径。网关是无状态的,因此 `store` 和 `previous_response_id` 会被忽略——请像
+Codex CLI 那样在 `input` 中带上完整对话。回传到 `input` 里的 reasoning item 会被丢弃,因为 Bedrock
+只接受带原始 signature 的思考块,而 Responses 协议里没有这个字段。托管工具(`web_search`、
+`file_search`、托管模式的 `tool_search` 等)在 Bedrock 上没有对应实现,会被丢弃并记录警告日志。
+响应中的 `tools` 只回显请求 `tools` 里实际生效的声明。`tool_choice: "none"` 会退化为 `"auto"`,
+`allowed_tools` 会被忽略。
 
 当请求开启了 reasoning 但没给 `max_output_tokens` 时,网关必须补上 Bedrock 要求的 maxTokens,
 此时取 `DEFAULT_MAX_TOKENS`(默认 32768)。

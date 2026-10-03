@@ -206,18 +206,82 @@ env_key = "BEDROCK_GATEWAY_API_KEY"
 wire_api = "responses"
 ```
 
-GPT-6 / GPT-5.x reject the `temperature` field and return encrypted `redactedContent` instead of
-plaintext reasoning; the gateway drops `temperature` for them and skips the encrypted block, so
-no extra configuration is required.
+These models use the native passthrough described below, so Codex's MCP namespaces,
+`tool_search` and custom tools reach them unchanged.
+
+To check that Codex really calls MCP tools, do not rely on an HTTP 200 or on Codex listing the
+tools: a dropped tool still gives a 200. Run a prompt that needs one MCP tool. Then open the session
+rollout (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`) and look for an `item_completed` event
+whose item has `"type":"McpToolCall"`, the expected `server` and `tool`, and
+`"status":"completed"`. App Server clients receive the same item as `mcpToolCall`.
+
+### Native Passthrough for OpenAI GPT Models
+
+Bedrock serves the OpenAI GPT models through its own
+[Responses API](https://docs.aws.amazon.com/bedrock/latest/userguide/inference-responses-api.html)
+on `bedrock-runtime`. The gateway therefore forwards their requests as is instead of translating
+them to Converse. This applies when the model id matches `*openai.gpt-*` and not `*gpt-oss*`; the
+match is made after the `gpt-*` → `DEFAULT_MODEL` alias. The request goes to
+`https://bedrock-runtime.<AWS_REGION>.amazonaws.com/openai/v1/responses` and is signed with SigV4
+using the gateway's AWS credentials. The gateway API key is still checked and is never forwarded.
+Streaming events are relayed byte for byte, and upstream errors keep their status code and body.
+
+| Environment variable | Default | Purpose |
+| --- | --- | --- |
+| `RESPONSES_NATIVE_MODEL_PATTERNS` | `*openai.gpt-*` | Comma-separated, case-insensitive glob patterns of model ids to pass through. An empty value disables the passthrough. |
+| `RESPONSES_NATIVE_EXCLUDE_PATTERNS` | `*gpt-oss*` | Model ids that match these patterns stay on Converse. |
+| `BEDROCK_RUNTIME_RESPONSES_URL` | `https://bedrock-runtime.<AWS_REGION>.amazonaws.com/openai/v1/responses` | Overrides the upstream URL. |
+
+- **store.** When the client does not set `store`, the gateway sends `store: false`, so Bedrock
+  keeps no conversation data. An explicit `store: true` is honoured, and `previous_response_id`
+  then works. Only `POST /responses` is proxied, so stored responses cannot be fetched through the
+  gateway.
+- **IAM.** Bedrock authorises `bedrock:InvokeModel` (or `InvokeModelWithResponseStream`) on the
+  inference profile and on the account's default project,
+  `arn:aws:bedrock:*:<account>:project/default`. Both CloudFormation templates grant it. Add it
+  yourself if you use your own role.
+- **Endpoint limits.** Name a `us.` / `global.` (or `us-gov.`) cross-Region inference profile.
+  Foundation-model ids and application inference profiles are rejected, and so is
+  `background: true`. Hosted tools such as `web_search` are not available, and Guardrails do not
+  apply. GPT OSS models have no Responses support on `bedrock-runtime`, which is why they are
+  excluded and stay on Converse.
+
+If you disable the passthrough, GPT-6 / GPT-5.x go through Converse. They reject the `temperature`
+field and return encrypted `redactedContent` instead of plaintext reasoning, so the gateway drops
+`temperature` for them and skips the encrypted block.
+
+### Tools on the Converse Path
+
+For every other model, the translation carries the tool protocol that Codex uses:
+
+- **Namespace groups** (how Codex sends MCP tools). Each member becomes a Bedrock tool named
+  `<namespace>__<name>`. If that name is invalid, longer than 64 characters or taken, it is
+  sanitised, truncated and given a short hash. The mapping is rebuilt from each request, so
+  replayed history gets the same names. Calls come back as `function_call` items with the
+  original `namespace` and `name`, both streaming and non-streaming. `defer_loading` is ignored,
+  so deferred tools are offered up front.
+- **tool_choice.** `"required"` becomes Bedrock `any`. A named function (with an optional
+  `namespace`) or a named custom tool becomes Bedrock `tool`. When nothing is left to force, or the
+  named tool is not declared, the gateway returns 400 before calling Bedrock:
+  `{"error": {"type": "invalid_request_error", "param": "tool_choice", ...}}`.
+- **tool_search** with `execution: "client"` is offered to the model as a function. The model's
+  call is returned as a `tool_search_call` item. When a later request replays a
+  `tool_search_output`, the tools it lists are added to that request.
+- **additional_tools** input items add their tools to the request's tool list.
+- **Custom tools** (for example Codex's grammar-based `exec`) are sent as a function that takes a
+  single string `input`, and calls come back as `custom_tool_call` items. The grammar goes into
+  the tool description, because Bedrock cannot enforce it.
 
 ### Limitations
 
-The gateway is stateless, so `store` and `previous_response_id` are ignored — send the whole
-conversation in `input`, which is what the Codex CLI does. Reasoning items you send back in
-`input` are dropped, because Bedrock only accepts a reasoning block together with the signature it
-issued and that signature has no place in the Responses wire format. Hosted tools
-(`web_search`, `file_search`, ...) and `namespace` tool groups are dropped with a log warning,
-having no Bedrock counterpart, and `tool_choice: "none"` falls back to `"auto"`.
+These apply to the Converse path. The gateway is stateless, so `store` and `previous_response_id`
+are ignored — send the whole conversation in `input`, which is what the Codex CLI does. Reasoning
+items you send back in `input` are dropped, because Bedrock only accepts a reasoning block together
+with the signature it issued and that signature has no place in the Responses wire format. Hosted
+tools (`web_search`, `file_search`, hosted `tool_search`, ...) are dropped with a log warning,
+having no Bedrock counterpart. The response's `tools` echoes only the declarations from the
+request's `tools` that took effect. `tool_choice: "none"` falls back to `"auto"`, and
+`allowed_tools` is ignored.
 
 When a request enables reasoning without `max_output_tokens`, the gateway has to supply the
 maxTokens that Bedrock requires; it uses `DEFAULT_MAX_TOKENS` (32,768 by default).

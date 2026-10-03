@@ -161,3 +161,7 @@ cython_debug/
 
 Config
 .vscode/launch.json
+
+# Chorus local state; only spec-lite specs are versioned
+.chorus/*
+!.chorus/specs/
