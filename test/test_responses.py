@@ -1,6 +1,7 @@
 """Tests for the Responses API translation layer."""
 
 import json
+import re
 
 import pytest
 from fastapi import HTTPException
@@ -8,10 +9,10 @@ from fastapi import HTTPException
 from api.models.responses import BedrockResponsesModel
 from api.schema import (
     AssistantMessage,
+    ResponsesRequest,
     SystemMessage,
     ToolMessage,
     UserMessage,
-    ResponsesRequest,
 )
 
 MODEL = "anthropic.claude-3-sonnet-20240229-v1:0"
@@ -193,13 +194,16 @@ def test_flat_function_tools_are_converted():
 
 
 def test_tool_choice_shapes():
+    tools = [{"type": "function", "name": "f", "parameters": {"type": "object", "properties": {}}}]
     assert build(input="Hi").tool_choice == "auto"
-    assert build(input="Hi", tool_choice="required").tool_choice == "required"
+    assert build(input="Hi", tools=tools, tool_choice="required").tool_choice == "required"
     # Bedrock has no "none", so it degrades to letting the model decide.
     assert build(input="Hi", tool_choice="none").tool_choice == "auto"
-    assert build(input="Hi", tool_choice={"type": "function", "name": "f"}).tool_choice == {
+    assert build(input="Hi", tools=tools, tool_choice={"type": "function", "name": "f"}).tool_choice == {
         "function": {"name": "f"}
     }
+    # allowed_tools and hosted tool choices have no Bedrock counterpart.
+    assert build(input="Hi", tools=tools, tool_choice={"type": "allowed_tools", "tools": []}).tool_choice == "auto"
 
 
 def test_reasoning_effort_is_mapped_and_gets_a_token_budget():
@@ -445,3 +449,714 @@ def test_plain_history_without_tools_has_no_tool_config(monkeypatch):
     args = model._parse_request(build(input="hello"))
 
     assert "toolConfig" not in args
+
+
+# --- Namespaces, name mapping and tool_choice ---------------------------------------------
+
+TOOL_NAME = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+SCHEMA = {"type": "object", "properties": {"q": {"type": "string"}}}
+
+
+def function(name, **extra):
+    return {"type": "function", "name": name, "description": f"{name} tool", "parameters": SCHEMA, **extra}
+
+
+def namespace(name, *members):
+    return {"type": "namespace", "name": name, "description": f"{name} server", "tools": list(members)}
+
+
+def bedrock_args(chat_request, monkeypatch):
+    from api.models.bedrock import BedrockModel
+
+    model = BedrockModel()
+    monkeypatch.setattr(model, "_resolve_to_foundation_model", lambda model_id: model_id)
+    return model._parse_request(chat_request)
+
+
+def tool_names(chat_request):
+    return [tool.function.name for tool in chat_request.tools]
+
+
+def assert_valid_and_unique(names):
+    assert all(TOOL_NAME.match(name) for name in names), names
+    assert len(set(names)) == len(names)
+
+
+def test_namespace_only_request_builds_a_tool_config_and_required_maps_to_any(monkeypatch):
+    chat_request = build(
+        input="check in",
+        tools=[namespace("mcp__chorus", function("chorus_checkin"))],
+        tool_choice="required",
+    )
+
+    args = bedrock_args(chat_request, monkeypatch)
+
+    assert [tool["toolSpec"]["name"] for tool in args["toolConfig"]["tools"]] == ["mcp__chorus__chorus_checkin"]
+    assert args["toolConfig"]["tools"][0]["toolSpec"]["inputSchema"]["json"] == SCHEMA
+    assert args["toolConfig"]["toolChoice"] == {"any": {}}
+
+
+def test_same_name_in_two_namespaces_gets_two_bedrock_names():
+    chat_request = build(
+        input="Hi",
+        tools=[namespace("mcp__a", function("search")), namespace("mcp__b", function("search"))],
+    )
+
+    assert tool_names(chat_request) == ["mcp__a__search", "mcp__b__search"]
+
+
+def test_long_and_invalid_names_are_sanitised_and_hashed():
+    long_name = "x" * 70
+    chat_request = build(
+        input="Hi",
+        tools=[
+            function(long_name),
+            namespace("mcp__srv", function("read.file"), function("y" * 60)),
+            function("has space"),
+        ],
+    )
+
+    names = tool_names(chat_request)
+    assert_valid_and_unique(names)
+    assert names[0].startswith("x" * 55 + "_")
+    assert names[1].startswith("mcp__srv__read_file_")
+    assert names[3].startswith("has_space_")
+
+
+def test_top_level_and_namespace_collision_stays_unique():
+    chat_request = build(
+        input="Hi",
+        tools=[function("mcp__chorus__chorus_checkin"), namespace("mcp__chorus", function("chorus_checkin"))],
+    )
+
+    names = tool_names(chat_request)
+    assert_valid_and_unique(names)
+    # The first declaration keeps the natural name.
+    assert names[0] == "mcp__chorus__chorus_checkin"
+    assert names[1] != names[0]
+
+
+def test_hashed_names_resolve_their_own_collisions():
+    from api.models.responses import ToolRegistry, _hashed_tool_name
+
+    registry = ToolRegistry()
+    taken = _hashed_tool_name("mcp__srv", "read.file")
+    registry.add_declaration(function(taken))
+    registry.add_declaration(namespace("mcp__srv", function("read.file")))
+
+    names = list(registry.by_bedrock)
+    assert_valid_and_unique(names)
+    assert names[0] == taken
+
+
+def test_name_mapping_is_deterministic():
+    kwargs = dict(
+        input="Hi",
+        tools=[
+            function("z" * 80),
+            namespace("mcp__a", function("search"), function("bad/name")),
+            namespace("mcp__b", function("search")),
+            function("mcp__a__search"),
+        ],
+    )
+
+    first, second = tool_names(build(**kwargs)), tool_names(build(**kwargs))
+
+    assert first == second
+    assert_valid_and_unique(first)
+
+
+def test_named_tool_choice_with_namespace_selects_the_mapped_tool(monkeypatch):
+    chat_request = build(
+        input="Hi",
+        tools=[namespace("mcp__a", function("search")), namespace("mcp__b", function("search"))],
+        tool_choice={"type": "function", "name": "search", "namespace": "mcp__b"},
+    )
+
+    args = bedrock_args(chat_request, monkeypatch)
+
+    assert args["toolConfig"]["toolChoice"] == {"tool": {"name": "mcp__b__search"}}
+
+
+@pytest.mark.parametrize(
+    "tools, tool_choice",
+    [
+        (None, "required"),
+        # Hosted tools are dropped, so nothing is left to require.
+        ([{"type": "web_search"}], "required"),
+        ([function("search")], {"type": "function", "name": "missing"}),
+        ([namespace("mcp__a", function("search"))], {"type": "function", "name": "search"}),
+        ([namespace("mcp__a", function("search"))], {"type": "function", "name": "search", "namespace": "mcp__b"}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_unsatisfiable_tool_choice_is_rejected_before_invoking_bedrock(tools, tool_choice):
+    chat_model = FakeChatModel()
+    model = BedrockResponsesModel(chat_model=chat_model)
+    request = ResponsesRequest(model=MODEL, input="Hi", tools=tools, tool_choice=tool_choice)
+
+    with pytest.raises(HTTPException) as exc:
+        await model.respond(request)
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail["param"] == "tool_choice"
+    assert exc.value.detail["message"]
+    assert chat_model.chat_request is None
+
+
+def test_history_tool_does_not_satisfy_a_named_tool_choice():
+    # A call replayed from history only gets a placeholder, which is not a declared tool.
+    with pytest.raises(HTTPException):
+        build(
+            input=[
+                {"role": "user", "content": "go"},
+                {"type": "function_call", "call_id": "c1", "name": "old", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+            ],
+            tools=[function("new")],
+            tool_choice={"type": "function", "name": "old"},
+        )
+
+
+def test_unsatisfiable_tool_choice_returns_an_openai_error_body(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from api import app as app_module
+    from api.models import bedrock as bedrock_module
+    from api.setting import API_ROUTE_PREFIX
+
+    monkeypatch.setattr(bedrock_module, "bedrock_model_list", {MODEL: {"modalities": ["TEXT"]}})
+
+    def fail_converse(**kwargs):
+        raise AssertionError("Bedrock must not be called")
+
+    monkeypatch.setattr(bedrock_module.bedrock_runtime, "converse", fail_converse)
+    client = TestClient(app_module.app)
+
+    response = client.post(
+        f"{API_ROUTE_PREFIX}/responses",
+        headers={"Authorization": "Bearer test-api-key"},
+        json={"model": MODEL, "input": "Hi", "tool_choice": "required"},
+    )
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert isinstance(error["message"], str) and error["message"]
+    assert error == {
+        "message": error["message"],
+        "type": "invalid_request_error",
+        "param": "tool_choice",
+        "code": None,
+    }
+
+    # A body that fails validation gets the same shape, without a param.
+    response = client.post(
+        f"{API_ROUTE_PREFIX}/responses",
+        headers={"Authorization": "Bearer test-api-key"},
+        json={"model": MODEL, "input": "Hi", "temperature": 5},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert response.json()["error"]["param"] is None
+
+
+# --- Namespaced output and replay ------------------------------------------------------------
+
+NAMESPACED_TOOLS = [function("shell"), namespace("mcp__chorus", function("chorus_checkin"))]
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_tool_uses_map_back_to_namespace_and_name():
+    chat_model = FakeChatModel(
+        response={
+            "output": {
+                "message": {
+                    "content": [
+                        {"toolUse": {"toolUseId": "tooluse_1", "name": "mcp__chorus__chorus_checkin", "input": {}}},
+                        {"toolUse": {"toolUseId": "tooluse_2", "name": "shell", "input": {"q": "ls"}}},
+                    ]
+                }
+            },
+            "usage": {"outputTokens": 4, "totalTokens": 12},
+            "stopReason": "tool_use",
+        }
+    )
+    request = ResponsesRequest(model=MODEL, input="Hi", tools=NAMESPACED_TOOLS)
+
+    response = await BedrockResponsesModel(chat_model=chat_model).respond(request)
+
+    items = response.model_dump()["output"]
+    assert items[0]["type"] == "function_call"
+    assert items[0]["name"] == "chorus_checkin"
+    assert items[0]["namespace"] == "mcp__chorus"
+    assert items[0]["call_id"] == "tooluse_1"
+    assert items[1]["name"] == "shell"
+    assert items[1]["call_id"] == "tooluse_2"
+    assert "namespace" not in items[1]
+    assert "namespace" not in json.loads(response.model_dump_json())["output"][1]
+
+
+@pytest.mark.asyncio
+async def test_streaming_tool_uses_map_back_to_namespace_and_name():
+    chunks = [
+        {
+            "contentBlockStart": {
+                "contentBlockIndex": 0,
+                "start": {"toolUse": {"toolUseId": "tooluse_1", "name": "mcp__chorus__chorus_checkin"}},
+            }
+        },
+        {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"toolUse": {"input": "{}"}}}},
+        {"contentBlockStop": {"contentBlockIndex": 0}},
+        {"contentBlockStart": {"contentBlockIndex": 1, "start": {"toolUse": {"toolUseId": "tooluse_2", "name": "shell"}}}},
+        {"contentBlockDelta": {"contentBlockIndex": 1, "delta": {"toolUse": {"input": '{"q":"ls"}'}}}},
+        {"contentBlockStop": {"contentBlockIndex": 1}},
+        {"messageStop": {"stopReason": "tool_use"}},
+        {"metadata": {"usage": {"outputTokens": 4, "totalTokens": 12}}},
+    ]
+    model = BedrockResponsesModel(chat_model=FakeChatModel(chunks=chunks))
+    request = ResponsesRequest(model=MODEL, input="Hi", tools=NAMESPACED_TOOLS, stream=True)
+
+    events = await collect(model.respond_stream(request))
+
+    assert [event["type"] for event in events] == [
+        "response.created",
+        "response.in_progress",
+        "response.output_item.added",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.output_item.done",
+        "response.output_item.added",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.output_item.done",
+        "response.completed",
+    ]
+    added = [e["item"] for e in events if e["type"] == "response.output_item.added"]
+    done = [e["item"] for e in events if e["type"] == "response.output_item.done"]
+    for items in (added, done, events[-1]["response"]["output"]):
+        assert (items[0]["namespace"], items[0]["name"], items[0]["call_id"]) == (
+            "mcp__chorus",
+            "chorus_checkin",
+            "tooluse_1",
+        )
+        assert (items[1]["name"], items[1]["call_id"]) == ("shell", "tooluse_2")
+        assert "namespace" not in items[1]
+
+
+def test_namespaced_function_call_replay_pairs_tool_use_and_result(monkeypatch):
+    chat_request = build(
+        input=[
+            {"role": "user", "content": "check in"},
+            {
+                "type": "function_call",
+                "call_id": "tooluse_1",
+                "namespace": "mcp__chorus",
+                "name": "chorus_checkin",
+                "arguments": "{}",
+            },
+            {"type": "function_call_output", "call_id": "tooluse_1", "output": "checked in"},
+        ],
+        tools=NAMESPACED_TOOLS,
+    )
+
+    messages = bedrock_args(chat_request, monkeypatch)["messages"]
+
+    tool_use = messages[1]["content"][0]["toolUse"]
+    tool_result = messages[2]["content"][0]["toolResult"]
+    assert tool_use["name"] == "mcp__chorus__chorus_checkin"
+    assert tool_use["toolUseId"] == tool_result["toolUseId"] == "tooluse_1"
+    # No placeholder: the call maps onto the declared tool.
+    assert tool_names(chat_request) == ["shell", "mcp__chorus__chorus_checkin"]
+
+
+def test_replayed_call_to_an_undeclared_tool_gets_a_placeholder(monkeypatch):
+    chat_request = build(
+        input=[
+            {"role": "user", "content": "go"},
+            {"type": "function_call", "call_id": "c1", "namespace": "mcp__gone", "name": "x", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+        ],
+        tools=[function("shell")],
+    )
+
+    args = bedrock_args(chat_request, monkeypatch)
+
+    assert [tool["toolSpec"]["name"] for tool in args["toolConfig"]["tools"]] == ["shell", "mcp__gone__x"]
+    assert args["messages"][1]["content"][0]["toolUse"]["name"] == "mcp__gone__x"
+
+
+# --- Effective tools echo ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_response_echoes_only_effective_tools(caplog):
+    chat_model = FakeChatModel(
+        response={
+            "output": {"message": {"content": [{"text": "ok"}]}},
+            "usage": {"outputTokens": 1, "totalTokens": 3},
+            "stopReason": "end_turn",
+        }
+    )
+    tools = [
+        {"type": "web_search"},
+        function("shell"),
+        namespace(
+            "mcp__chorus",
+            function("chorus_checkin", defer_loading=True),
+            {"type": "web_search"},
+        ),
+        namespace("mcp__empty", {"type": "file_search"}),
+    ]
+    request = ResponsesRequest(model=MODEL, input="Hi", tools=tools)
+    model = BedrockResponsesModel(chat_model=chat_model)
+
+    with caplog.at_level("WARNING"):
+        response = await model.respond(request)
+
+    # The deferred member is registered up front.
+    assert tool_names(chat_model.chat_request) == ["shell", "mcp__chorus__chorus_checkin"]
+    assert response.tools == [
+        function("shell"),
+        {**namespace("mcp__chorus"), "tools": [function("chorus_checkin", defer_loading=True)]},
+    ]
+    assert "web_search" in caplog.text
+
+
+# --- tool_search, additional_tools and custom tools ------------------------------------------
+
+# The shapes Codex rust-v0.160.0 sends: tool_search per
+# core/src/tools/handlers/tool_search_spec.rs, custom exec per a captured responses_lite request.
+TOOL_SEARCH = {
+    "type": "tool_search",
+    "execution": "client",
+    "description": "# Tool discovery",
+    "parameters": {
+        "type": "object",
+        "properties": {"limit": {"type": "number"}, "query": {"type": "string"}},
+        "required": ["query"],
+        "additionalProperties": False,
+    },
+}
+LARK = "start: SOURCE\nSOURCE: /[\\s\\S]+/\n"
+EXEC = {
+    "type": "custom",
+    "name": "exec",
+    "description": "Run JavaScript code",
+    "format": {"type": "grammar", "syntax": "lark", "definition": LARK},
+}
+DEFERRED_CHORUS = namespace("mcp__chorus", function("chorus_checkin", defer_loading=True))
+
+
+def converse_response(*blocks, stop_reason="tool_use"):
+    return {
+        "output": {"message": {"content": list(blocks)}},
+        "usage": {"outputTokens": 4, "totalTokens": 12},
+        "stopReason": stop_reason,
+    }
+
+
+def tool_use_chunks(tool_use_id, name, *input_parts):
+    return [
+        {"contentBlockStart": {"contentBlockIndex": 0, "start": {"toolUse": {"toolUseId": tool_use_id, "name": name}}}},
+        *[
+            {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"toolUse": {"input": part}}}}
+            for part in input_parts
+        ],
+        {"contentBlockStop": {"contentBlockIndex": 0}},
+        {"messageStop": {"stopReason": "tool_use"}},
+        {"metadata": {"usage": {"outputTokens": 4, "totalTokens": 12}}},
+    ]
+
+
+def test_client_tool_search_becomes_a_bedrock_function(monkeypatch):
+    chat_request = build(input="find chorus tools", tools=[TOOL_SEARCH])
+
+    tools = bedrock_args(chat_request, monkeypatch)["toolConfig"]["tools"]
+
+    assert [tool["toolSpec"]["name"] for tool in tools] == ["tool_search"]
+    assert tools[0]["toolSpec"]["inputSchema"]["json"] == TOOL_SEARCH["parameters"]
+
+
+def test_hosted_tool_search_is_dropped(caplog):
+    with caplog.at_level("WARNING"):
+        chat_request = build(input="hi", tools=[{**TOOL_SEARCH, "execution": "server"}, function("shell")])
+
+    assert tool_names(chat_request) == ["shell"]
+    assert "tool_search" in caplog.text
+
+
+def test_tool_search_does_not_collide_with_a_function_of_the_same_name():
+    chat_request = build(input="hi", tools=[TOOL_SEARCH, function("tool_search")])
+
+    names = tool_names(chat_request)
+    assert names[0] == "tool_search"
+    assert_valid_and_unique(names)
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_tool_search_call():
+    chat_model = FakeChatModel(
+        response=converse_response(
+            {"toolUse": {"toolUseId": "tooluse_s", "name": "tool_search", "input": {"query": "chorus", "limit": 5}}}
+        )
+    )
+    request = ResponsesRequest(model=MODEL, input="find", tools=[TOOL_SEARCH])
+
+    response = await BedrockResponsesModel(chat_model=chat_model).respond(request)
+
+    item = json.loads(response.model_dump_json())["output"][0]
+    assert item["id"].startswith("tsc_")
+    assert {k: v for k, v in item.items() if k != "id"} == {
+        "type": "tool_search_call",
+        "call_id": "tooluse_s",
+        "execution": "client",
+        "status": "completed",
+        "arguments": {"query": "chorus", "limit": 5},
+    }
+
+
+@pytest.mark.asyncio
+async def test_streaming_tool_search_call_is_buffered():
+    chunks = tool_use_chunks("tooluse_s", "tool_search", '{"query": "cho', 'rus"}')
+    model = BedrockResponsesModel(chat_model=FakeChatModel(chunks=chunks))
+    request = ResponsesRequest(model=MODEL, input="find", tools=[TOOL_SEARCH], stream=True)
+
+    events = await collect(model.respond_stream(request))
+
+    assert [event["type"] for event in events] == [
+        "response.created",
+        "response.in_progress",
+        "response.output_item.added",
+        "response.output_item.done",
+        "response.completed",
+    ]
+    added, done = events[2]["item"], events[3]["item"]
+    assert added["type"] == done["type"] == "tool_search_call"
+    assert added["status"] == "in_progress"
+    assert added["id"] == done["id"]
+    assert (done["call_id"], done["execution"], done["status"]) == ("tooluse_s", "client", "completed")
+    assert done["arguments"] == {"query": "chorus"}
+    assert events[-1]["response"]["output"] == [done]
+
+
+def tool_search_history():
+    return [
+        {"role": "user", "content": "check in to chorus"},
+        {
+            "type": "tool_search_call",
+            "call_id": "tooluse_s",
+            "execution": "client",
+            "status": "completed",
+            "arguments": {"query": "chorus checkin"},
+        },
+        {
+            "type": "tool_search_output",
+            "call_id": "tooluse_s",
+            "execution": "client",
+            "status": "completed",
+            "tools": [DEFERRED_CHORUS],
+        },
+    ]
+
+
+def test_tool_search_replay_registers_the_loaded_tools(monkeypatch):
+    chat_request = build(input=tool_search_history(), tools=[TOOL_SEARCH])
+
+    args = bedrock_args(chat_request, monkeypatch)
+
+    assert [tool["toolSpec"]["name"] for tool in args["toolConfig"]["tools"]] == [
+        "tool_search",
+        "mcp__chorus__chorus_checkin",
+    ]
+    messages = args["messages"]
+    tool_use = messages[1]["content"][0]["toolUse"]
+    tool_result = messages[2]["content"][0]["toolResult"]
+    assert tool_use == {"toolUseId": "tooluse_s", "name": "tool_search", "input": {"query": "chorus checkin"}}
+    assert tool_result["toolUseId"] == "tooluse_s"
+    assert "mcp__chorus__chorus_checkin: chorus_checkin tool" in tool_result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_tool_loaded_by_tool_search_is_called_with_its_namespace():
+    chat_model = FakeChatModel(
+        response=converse_response(
+            {"toolUse": {"toolUseId": "tooluse_c", "name": "mcp__chorus__chorus_checkin", "input": {}}}
+        )
+    )
+    request = ResponsesRequest(model=MODEL, input=tool_search_history(), tools=[TOOL_SEARCH])
+    model = BedrockResponsesModel(chat_model=chat_model)
+
+    response = await model.respond(request)
+
+    item = response.model_dump()["output"][0]
+    assert (item["type"], item["namespace"], item["name"], item["call_id"]) == (
+        "function_call",
+        "mcp__chorus",
+        "chorus_checkin",
+        "tooluse_c",
+    )
+    # Loaded tools reach Bedrock but the echo mirrors request.tools.
+    assert response.tools == [TOOL_SEARCH]
+
+
+def test_replayed_tool_search_without_a_declared_tool_search_gets_a_placeholder(monkeypatch):
+    chat_request = build(input=tool_search_history(), tools=[function("shell")])
+
+    args = bedrock_args(chat_request, monkeypatch)
+
+    names = [tool["toolSpec"]["name"] for tool in args["toolConfig"]["tools"]]
+    assert names == ["shell", "mcp__chorus__chorus_checkin", "tool_search"]
+    assert args["messages"][1]["content"][0]["toolUse"]["name"] == "tool_search"
+
+
+def test_additional_tools_item_registers_tools_without_a_message(monkeypatch):
+    # The Codex responses_lite shape: no request.tools, a developer-role item with no content.
+    chat_request = build(
+        input=[
+            {
+                "type": "additional_tools",
+                "id": "at_1",
+                "role": "developer",
+                "tools": [namespace("functions", EXEC, function("wait")), TOOL_SEARCH],
+            },
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "be helpful"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "say hi"}]},
+        ]
+    )
+
+    args = bedrock_args(chat_request, monkeypatch)
+
+    assert [tool["toolSpec"]["name"] for tool in args["toolConfig"]["tools"]] == [
+        "functions__exec",
+        "functions__wait",
+        "tool_search",
+    ]
+    assert [message.role for message in chat_request.messages] == ["developer", "user"]
+    assert [message["role"] for message in args["messages"]] == ["user"]
+
+
+def test_additional_tools_alone_is_not_a_conversation():
+    with pytest.raises(HTTPException) as error:
+        build(input=[{"type": "additional_tools", "role": "developer", "tools": [function("shell")]}])
+
+    assert error.value.status_code == 400
+
+
+def test_custom_tool_becomes_a_function_with_a_string_input(monkeypatch):
+    chat_request = build(input="run it", tools=[EXEC])
+
+    spec = bedrock_args(chat_request, monkeypatch)["toolConfig"]["tools"][0]["toolSpec"]
+
+    assert spec["name"] == "exec"
+    assert spec["inputSchema"]["json"] == {
+        "type": "object",
+        "properties": {"input": {"type": "string", "description": "The raw input for the tool."}},
+        "required": ["input"],
+    }
+    assert spec["description"].startswith("Run JavaScript code")
+    assert LARK in spec["description"]
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_custom_tool_call():
+    chat_model = FakeChatModel(
+        response=converse_response(
+            {"toolUse": {"toolUseId": "tooluse_x", "name": "functions__exec", "input": {"input": "console.log(1)"}}},
+            {"toolUse": {"toolUseId": "tooluse_y", "name": "exec", "input": {"input": "2"}}},
+        )
+    )
+    request = ResponsesRequest(model=MODEL, input="run", tools=[namespace("functions", EXEC), EXEC])
+
+    response = await BedrockResponsesModel(chat_model=chat_model).respond(request)
+
+    items = json.loads(response.model_dump_json())["output"]
+    assert items[0]["id"].startswith("ctc_")
+    assert {k: v for k, v in items[0].items() if k != "id"} == {
+        "type": "custom_tool_call",
+        "call_id": "tooluse_x",
+        "name": "exec",
+        "namespace": "functions",
+        "input": "console.log(1)",
+        "status": "completed",
+    }
+    assert items[1]["type"] == "custom_tool_call"
+    assert (items[1]["name"], items[1]["input"]) == ("exec", "2")
+    assert "namespace" not in items[1]
+
+
+@pytest.mark.asyncio
+async def test_streaming_custom_tool_call_is_buffered():
+    chunks = tool_use_chunks("tooluse_x", "exec", '{"input": "console', '.log(1)"}')
+    model = BedrockResponsesModel(chat_model=FakeChatModel(chunks=chunks))
+    request = ResponsesRequest(model=MODEL, input="run", tools=[EXEC], stream=True)
+
+    events = await collect(model.respond_stream(request))
+
+    assert [event["type"] for event in events] == [
+        "response.created",
+        "response.in_progress",
+        "response.output_item.added",
+        "response.custom_tool_call_input.delta",
+        "response.custom_tool_call_input.done",
+        "response.output_item.done",
+        "response.completed",
+    ]
+    added, done = events[2]["item"], events[5]["item"]
+    assert (added["type"], added["status"], added["input"]) == ("custom_tool_call", "in_progress", "")
+    assert events[3]["delta"] == events[4]["input"] == "console.log(1)"
+    assert events[3]["item_id"] == events[4]["item_id"] == done["id"]
+    assert (done["call_id"], done["name"], done["input"], done["status"]) == (
+        "tooluse_x",
+        "exec",
+        "console.log(1)",
+        "completed",
+    )
+    assert events[-1]["response"]["output"] == [done]
+
+
+def test_custom_tool_call_replay_pairs_tool_use_and_result(monkeypatch):
+    chat_request = build(
+        input=[
+            {"role": "user", "content": "run"},
+            {"type": "custom_tool_call", "call_id": "tooluse_x", "namespace": "functions", "name": "exec", "input": "1+1"},
+            {"type": "custom_tool_call_output", "call_id": "tooluse_x", "output": "2"},
+        ],
+        tools=[namespace("functions", EXEC)],
+    )
+
+    args = bedrock_args(chat_request, monkeypatch)
+
+    assert [tool["toolSpec"]["name"] for tool in args["toolConfig"]["tools"]] == ["functions__exec"]
+    tool_use = args["messages"][1]["content"][0]["toolUse"]
+    tool_result = args["messages"][2]["content"][0]["toolResult"]
+    assert tool_use == {"toolUseId": "tooluse_x", "name": "functions__exec", "input": {"input": "1+1"}}
+    assert tool_result == {"toolUseId": "tooluse_x", "content": [{"text": "2"}]}
+
+
+def test_parallel_replayed_calls_share_one_assistant_turn(monkeypatch):
+    chat_request = build(
+        input=[
+            {"role": "user", "content": "go"},
+            {"type": "custom_tool_call", "call_id": "a", "name": "exec", "input": "1"},
+            {"type": "function_call", "call_id": "b", "name": "shell", "arguments": "{}"},
+            {"type": "custom_tool_call_output", "call_id": "a", "output": "one"},
+            {"type": "function_call_output", "call_id": "b", "output": "two"},
+        ],
+        tools=[EXEC, function("shell")],
+    )
+
+    messages = bedrock_args(chat_request, monkeypatch)["messages"]
+
+    assert [message["role"] for message in messages] == ["user", "assistant", "user"]
+    assert [block["toolUse"]["toolUseId"] for block in messages[1]["content"]] == ["a", "b"]
+    assert [block["toolResult"]["toolUseId"] for block in messages[2]["content"]] == ["a", "b"]
+
+
+def test_custom_tool_choice_selects_the_custom_tool():
+    chat_request = build(input="run", tools=[EXEC, function("shell")], tool_choice={"type": "custom", "name": "exec"})
+
+    assert chat_request.tool_choice == {"function": {"name": "exec"}}
+
+    with pytest.raises(HTTPException) as error:
+        build(input="run", tools=[function("shell")], tool_choice={"type": "custom", "name": "shell"})
+    assert error.value.status_code == 400

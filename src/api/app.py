@@ -77,6 +77,27 @@ def anthropic_error(status_code: int, message: str) -> JSONResponse:
     )
 
 
+def is_responses_route(request) -> bool:
+    return request.url.path.startswith(f"{API_ROUTE_PREFIX}/responses")
+
+
+def openai_error(status_code: int, detail, headers: dict | None = None) -> JSONResponse:
+    # OpenAI SDKs (and so Codex) read {"error": {"message", "type", "param", "code"}}. A dict
+    # detail of {"message", "param"} names the offending request field.
+    if isinstance(detail, dict):
+        message = str(detail.get("message", ""))
+        param = detail.get("param")
+    else:
+        message = str(detail)
+        param = None
+    error_type = "server_error" if status_code >= 500 else "invalid_request_error"
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": {"message": message, "type": error_type, "param": param, "code": None}},
+        headers=headers,
+    )
+
+
 @app.get("/health")
 async def health():
     """For health check if needed"""
@@ -87,6 +108,8 @@ async def health():
 async def anthropic_http_exception_handler(request, exc):
     if is_anthropic_route(request):
         return anthropic_error(exc.status_code, str(exc.detail))
+    if is_responses_route(request):
+        return openai_error(exc.status_code, exc.detail, getattr(exc, "headers", None))
     return await http_exception_handler(request, exc)
 
 
@@ -104,6 +127,8 @@ async def validation_exception_handler(request, exc):
     
     if is_anthropic_route(request):
         return anthropic_error(400, str(exc))
+    if is_responses_route(request):
+        return openai_error(400, str(exc))
     return PlainTextResponse(str(exc), status_code=400)
 
 

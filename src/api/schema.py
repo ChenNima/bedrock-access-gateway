@@ -1,7 +1,7 @@
 import time
 from typing import Iterable, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_serializer
 
 from api.setting import DEFAULT_MODEL
 
@@ -260,11 +260,58 @@ class ResponsesFunctionCall(BaseModel):
     id: str
     call_id: str
     name: str
+    # Set for a member of a namespace tool. OpenAI omits the key for top-level functions.
+    namespace: str | None = None
     arguments: str
     status: Literal["in_progress", "completed", "incomplete"] = "completed"
 
+    @model_serializer(mode="wrap")
+    def _omit_empty_namespace(self, handler):
+        data = handler(self)
+        if data.get("namespace") is None:
+            data.pop("namespace", None)
+        return data
 
-ResponsesOutputItem = ResponsesReasoningItem | ResponsesOutputMessage | ResponsesFunctionCall
+
+class ResponsesCustomToolCall(BaseModel):
+    """A call to a custom (freeform) tool, whose input is a plain string rather than JSON."""
+
+    type: Literal["custom_tool_call"] = "custom_tool_call"
+    id: str
+    call_id: str
+    name: str
+    # Set for a custom tool declared inside a namespace; omitted otherwise.
+    namespace: str | None = None
+    input: str
+    status: Literal["in_progress", "completed", "incomplete"] = "completed"
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_namespace(self, handler):
+        data = handler(self)
+        if data.get("namespace") is None:
+            data.pop("namespace", None)
+        return data
+
+
+class ResponsesToolSearchCall(BaseModel):
+    """A call to a client-executed tool_search tool; the client runs the search."""
+
+    type: Literal["tool_search_call"] = "tool_search_call"
+    id: str
+    call_id: str
+    execution: Literal["client"] = "client"
+    status: Literal["in_progress", "completed", "incomplete"] = "completed"
+    # An object, unlike function_call.arguments which is a JSON string.
+    arguments: dict = {}
+
+
+ResponsesOutputItem = (
+    ResponsesReasoningItem
+    | ResponsesOutputMessage
+    | ResponsesFunctionCall
+    | ResponsesCustomToolCall
+    | ResponsesToolSearchCall
+)
 
 
 class ResponsesInputTokensDetails(BaseModel):

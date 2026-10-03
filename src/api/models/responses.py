@@ -14,11 +14,14 @@ Responses API needs it kept as a separate item.
 Ref: https://platform.openai.com/docs/api-reference/responses
 """
 
+import hashlib
 import json
 import logging
+import re
 import time
 import uuid
-from typing import AsyncIterable
+from dataclasses import dataclass, field
+from typing import AsyncIterable, Literal
 
 from fastapi import HTTPException
 from starlette.concurrency import run_in_threadpool
@@ -32,6 +35,7 @@ from api.schema import (
     ImageContent,
     ImageUrl,
     ResponseFunction,
+    ResponsesCustomToolCall,
     ResponsesFunctionCall,
     ResponsesInputTokensDetails,
     ResponsesOutputMessage,
@@ -41,6 +45,7 @@ from api.schema import (
     ResponsesReasoningSummary,
     ResponsesRequest,
     ResponsesResponse,
+    ResponsesToolSearchCall,
     ResponsesUsage,
     SystemMessage,
     TextContent,
@@ -70,7 +75,7 @@ IGNORED_INPUT_ITEM_TYPES = frozenset({"reasoning", "item_reference"})
 TEXT_PART_TYPES = frozenset({"input_text", "output_text", "text", "summary_text"})
 
 # Output item id prefixes, mirroring the ones OpenAI uses per item type.
-ITEM_ID_PREFIX = {"text": "msg", "reasoning": "rs", "tool": "fc"}
+ITEM_ID_PREFIX = {"text": "msg", "reasoning": "rs", "function": "fc", "custom": "ctc", "tool_search": "tsc"}
 
 
 def generate_id(prefix: str) -> str:
@@ -138,6 +143,323 @@ def _text_of(parts: list[TextContent | ImageContent]) -> str:
     return "\n".join(part.text for part in parts if isinstance(part, TextContent))
 
 
+# Bedrock's toolSpec.name constraint.
+VALID_TOOL_NAME = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+INVALID_TOOL_NAME_CHARS = re.compile(r"[^a-zA-Z0-9_-]")
+# Leaves room for "_" plus 8 hex digits of hash within the 64-character limit.
+HASHED_NAME_PREFIX_LENGTH = 55
+
+EMPTY_SCHEMA = {"type": "object", "properties": {}}
+# A custom (freeform) tool takes one free-text input. Converse only has JSON tools, so it is
+# exposed as a function with a single string argument.
+CUSTOM_TOOL_SCHEMA = {
+    "type": "object",
+    "properties": {"input": {"type": "string", "description": "The raw input for the tool."}},
+    "required": ["input"],
+}
+TOOL_SEARCH_NAME = "tool_search"
+# tool_search is not a (namespace, name) the client can call directly, so it gets an
+# identity no function can have.
+TOOL_SEARCH_IDENTITY = ("\x00tool_search", TOOL_SEARCH_NAME)
+TOOL_SEARCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "query": {"type": "string", "description": "Search query for deferred tools."},
+        "limit": {"type": "number", "description": "Maximum number of tools to return."},
+    },
+    "required": ["query"],
+}
+
+ToolKind = Literal["function", "custom", "tool_search"]
+PLACEHOLDER_SCHEMAS = {"function": EMPTY_SCHEMA, "custom": CUSTOM_TOOL_SCHEMA, "tool_search": TOOL_SEARCH_SCHEMA}
+
+
+def _hashed_tool_name(namespace: str | None, name: str, salt: int = 0) -> str:
+    """A valid Bedrock name for a tool whose natural name is invalid, too long or taken."""
+    base = f"{namespace}__{name}" if namespace else name
+    base = INVALID_TOOL_NAME_CHARS.sub("_", base)[:HASHED_NAME_PREFIX_LENGTH]
+    key = f"{namespace or ''}\x00{name}"
+    if salt:
+        key += f"\x00{salt}"
+    return f"{base}_{hashlib.sha1(key.encode('utf-8')).hexdigest()[:8]}"  # nosec B324 - not security relevant
+
+
+@dataclass
+class ToolEntry:
+    """One tool as Bedrock sees it, and where it came from on the Responses side."""
+
+    kind: ToolKind
+    bedrock_name: str
+    name: str
+    namespace: str | None
+    description: str | None
+    parameters: dict
+    # The declaration it came from; None for a placeholder standing in for a tool that
+    # only appears in replayed history.
+    source: dict | None = None
+
+    @property
+    def effective(self) -> bool:
+        return self.source is not None
+
+
+@dataclass
+class ToolRegistry:
+    """The tools of one request, keyed both by Bedrock name and by Responses identity.
+
+    The Responses API groups tools into namespaces and identifies a call by
+    (namespace, name), while Bedrock has a single flat list of names limited to
+    ``^[a-zA-Z0-9_-]{1,64}$``. The registry assigns every identity a Bedrock name and maps
+    tool uses back. It is rebuilt for every request: the mapping depends only on the
+    declarations and their order, so a client replaying history gets the same names.
+    """
+
+    by_bedrock: dict[str, ToolEntry] = field(default_factory=dict)
+    by_identity: dict[tuple[str | None, str], ToolEntry] = field(default_factory=dict)
+    # Declarations as echoed back in the response, trimmed to what was accepted.
+    declarations: list[dict] = field(default_factory=list)
+
+    @classmethod
+    def from_tools(cls, tools: list[dict] | None) -> "ToolRegistry":
+        registry = cls()
+        for tool in tools or []:
+            if isinstance(tool, dict):
+                registry.add_declaration(tool)
+        return registry
+
+    def add_declaration(self, tool: dict, echo: bool = True) -> bool:
+        """Register a top-level tool declaration. Returns whether anything was accepted."""
+        tool_type = tool.get("type")
+        if tool_type == "namespace":
+            namespace = tool.get("name")
+            if not namespace:
+                return False
+            members = [
+                member
+                for member in tool.get("tools") or []
+                if isinstance(member, dict) and self._add_member(member, namespace)
+            ]
+            if members and echo:
+                self.declarations.append({**tool, "tools": members})
+            return bool(members)
+
+        if tool_type in ("function", "custom"):
+            accepted = self._add_member(tool, None)
+            if accepted and echo:
+                self.declarations.append(tool)
+            return accepted
+
+        if tool_type == TOOL_SEARCH_NAME:
+            accepted = self._add_tool_search(tool)
+            if accepted and echo:
+                self.declarations.append(tool)
+            return accepted
+
+        # Hosted tools (web_search, file_search, computer_use, ...) run inside OpenAI and
+        # have no Bedrock counterpart.
+        logger.warning("Ignoring unsupported Responses tool of type %s", tool_type)
+        return False
+
+    def _add_member(self, tool: dict, namespace: str | None) -> bool:
+        """Register one callable tool, top-level or inside a namespace."""
+        if tool.get("type") == "custom":
+            return self._add_custom(tool, namespace)
+        if tool.get("type") != "function":
+            logger.warning(
+                "Ignoring unsupported Responses tool of type %s in namespace %s", tool.get("type"), namespace
+            )
+            return False
+        # Responses declares function tools flat; accept the nested Chat Completions shape too.
+        # defer_loading is ignored: Converse cannot load tools lazily, so a deferred tool is
+        # exposed up front, which costs input tokens but never hides a tool.
+        spec = tool["function"] if isinstance(tool.get("function"), dict) else tool
+        name = spec.get("name")
+        if not name:
+            return False
+        return self._register(
+            "function",
+            namespace,
+            name,
+            spec.get("description"),
+            spec.get("parameters") or EMPTY_SCHEMA,
+            tool,
+        )
+
+    def _add_custom(self, tool: dict, namespace: str | None) -> bool:
+        name = tool.get("name")
+        if not name:
+            return False
+        return self._register("custom", namespace, name, _custom_tool_description(tool), CUSTOM_TOOL_SCHEMA, tool)
+
+    def _add_tool_search(self, tool: dict) -> bool:
+        # Only a client-executed search can be served: the model's call is handed back to
+        # the client, which runs the search and replays the result as tool_search_output.
+        # A hosted search would have to run inside OpenAI.
+        if tool.get("execution") != "client":
+            logger.warning("Ignoring tool_search with execution %s, only client is supported", tool.get("execution"))
+            return False
+        return self._register(
+            "tool_search",
+            None,
+            TOOL_SEARCH_NAME,
+            tool.get("description"),
+            tool.get("parameters") or TOOL_SEARCH_SCHEMA,
+            tool,
+            identity=TOOL_SEARCH_IDENTITY,
+        )
+
+    def _register(
+        self,
+        kind: ToolKind,
+        namespace: str | None,
+        name: str,
+        description: str | None,
+        parameters: dict,
+        source: dict | None,
+        identity: tuple[str | None, str] | None = None,
+    ) -> bool:
+        identity = identity or (namespace, name)
+        if identity in self.by_identity:
+            # The first declaration of an identity wins.
+            logger.warning("Ignoring duplicate Responses tool %s", f"{namespace}.{name}" if namespace else name)
+            return False
+        entry = ToolEntry(
+            kind=kind,
+            bedrock_name=self._free_name(namespace, name),
+            name=name,
+            namespace=namespace,
+            description=description,
+            parameters=parameters,
+            source=source,
+        )
+        self.by_identity[identity] = entry
+        self.by_bedrock[entry.bedrock_name] = entry
+        return True
+
+    def add_loaded_tools(self, tools: list) -> None:
+        """Register tools that reach the model outside request.tools.
+
+        That is the additional_tools input item and the tools a tool_search_output loaded.
+        They are not echoed: the response's tools field mirrors the request's.
+        """
+        for tool in tools or []:
+            if isinstance(tool, dict):
+                self.add_declaration(tool, echo=False)
+
+    def _free_name(self, namespace: str | None, name: str) -> str:
+        preferred = f"{namespace}__{name}" if namespace else name
+        if VALID_TOOL_NAME.match(preferred) and preferred not in self.by_bedrock:
+            return preferred
+        salt = 0
+        candidate = _hashed_tool_name(namespace, name)
+        while candidate in self.by_bedrock:
+            salt += 1
+            candidate = _hashed_tool_name(namespace, name, salt)
+        return candidate
+
+    def resolve(self, namespace: str | None, name: str) -> ToolEntry | None:
+        """The declared tool with this identity, ignoring history placeholders."""
+        entry = self.by_identity.get((namespace or None, name))
+        return entry if entry is not None and entry.effective else None
+
+    def bedrock_name_for(self, namespace: str | None, name: str, kind: ToolKind = "function") -> str:
+        """The Bedrock name of a tool replayed from history.
+
+        A call to a tool the request no longer declares still has to be replayed, and
+        Converse rejects a toolUse whose name is not in toolConfig, so the identity gets a
+        placeholder tool.
+        """
+        namespace = namespace or None
+        identity = TOOL_SEARCH_IDENTITY if kind == "tool_search" else (namespace, name)
+        entry = self.by_identity.get(identity)
+        if entry is None:
+            self._register(
+                kind,
+                namespace,
+                name,
+                "Tool used earlier in this conversation.",
+                PLACEHOLDER_SCHEMAS[kind],
+                None,
+                identity=identity,
+            )
+            entry = self.by_identity[identity]
+        return entry.bedrock_name
+
+    def lookup(self, bedrock_name: str) -> ToolEntry | None:
+        return self.by_bedrock.get(bedrock_name)
+
+    @property
+    def has_effective_tools(self) -> bool:
+        return any(entry.effective for entry in self.by_bedrock.values())
+
+    def chat_tools(self) -> list[Tool] | None:
+        # Placeholders only matter alongside declared tools. Without any, the chat layer
+        # already builds a toolConfig from the history on its own.
+        if not self.has_effective_tools:
+            return None
+        return [
+            Tool(
+                function=Function(
+                    name=entry.bedrock_name,
+                    description=entry.description,
+                    parameters=entry.parameters,
+                )
+            )
+            for entry in self.by_bedrock.values()
+        ]
+
+    def effective_tools(self) -> list[dict]:
+        return list(self.declarations)
+
+
+def _custom_tool_description(tool: dict) -> str | None:
+    """The description of a custom tool, with its input format spelled out.
+
+    The format is enforced by OpenAI's constrained decoding; Bedrock can only be told.
+    """
+    description = tool.get("description")
+    tool_format = tool.get("format")
+    if not isinstance(tool_format, dict) or tool_format.get("type") != "grammar" or not tool_format.get("definition"):
+        return description
+    note = (
+        "Put the raw tool input in the `input` string. It must match this "
+        f"{tool_format.get('syntax') or ''} grammar:\n{tool_format['definition']}"
+    )
+    return f"{description}\n\n{note}" if description else note
+
+
+def _loaded_tools_text(tools: list, registry: ToolRegistry) -> str:
+    """The toolResult for a tool_search_output: the tools it made callable, one per line."""
+    lines = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") == "namespace":
+            members = [(tool.get("name"), member) for member in tool.get("tools") or [] if isinstance(member, dict)]
+        else:
+            members = [(None, tool)]
+        for namespace, member in members:
+            spec = member["function"] if isinstance(member.get("function"), dict) else member
+            entry = registry.resolve(namespace, spec.get("name") or "")
+            if entry is not None:
+                lines.append(f"{entry.bedrock_name}: {entry.description or ''}".rstrip())
+    if not lines:
+        return "No tools were found."
+    return "The following tools are now available:\n" + "\n".join(lines)
+
+
+def _tool_call_message(call_id: str, bedrock_name: str, arguments: str) -> AssistantMessage:
+    return AssistantMessage(
+        tool_calls=[
+            ToolCall(
+                id=call_id,
+                type="function",
+                function=ResponseFunction(name=bedrock_name, arguments=arguments),
+            )
+        ]
+    )
+
+
 def _convert_message_item(item: dict) -> list:
     role = item.get("role") or "user"
     parts = _content_parts(item.get("content"))
@@ -154,32 +476,58 @@ def _convert_message_item(item: dict) -> list:
     return [UserMessage(content=parts)] if parts else []
 
 
-def _convert_input_item(item: dict) -> list:
+def _convert_input_item(item: dict, registry: ToolRegistry) -> list:
     """Convert one Responses input item into zero or more chat messages."""
     item_type = item.get("type")
+
+    call_id = item.get("call_id") or item.get("id") or ""
 
     if item_type == "function_call":
         # An empty argument string is valid on the wire but not valid JSON, and the chat
         # layer json.loads() it on the way to Bedrock.
-        arguments = item.get("arguments") or "{}"
         return [
-            AssistantMessage(
-                tool_calls=[
-                    ToolCall(
-                        id=item.get("call_id") or item.get("id") or "",
-                        type="function",
-                        function=ResponseFunction(name=item.get("name"), arguments=arguments),
-                    )
-                ]
+            _tool_call_message(
+                call_id,
+                registry.bedrock_name_for(item.get("namespace"), item.get("name") or ""),
+                item.get("arguments") or "{}",
             )
         ]
-    if item_type == "function_call_output":
+    if item_type == "custom_tool_call":
+        return [
+            _tool_call_message(
+                call_id,
+                registry.bedrock_name_for(item.get("namespace"), item.get("name") or "", "custom"),
+                json.dumps({"input": item.get("input") or ""}),
+            )
+        ]
+    if item_type == "tool_search_call":
+        arguments = item.get("arguments")
+        if isinstance(arguments, str):
+            # Not the wire shape (an object), but cheap to accept.
+            arguments = _parse_arguments(arguments)
+        return [
+            _tool_call_message(
+                call_id,
+                registry.bedrock_name_for(None, TOOL_SEARCH_NAME, "tool_search"),
+                json.dumps(arguments or {}),
+            )
+        ]
+    if item_type in ("function_call_output", "custom_tool_call_output"):
         return [
             ToolMessage(
                 tool_call_id=item.get("call_id") or "",
                 content=_stringify(item.get("output")),
             )
         ]
+    if item_type == "tool_search_output":
+        # Its tools were registered before the input was replayed (see _register_input_tools).
+        return [
+            ToolMessage(tool_call_id=item.get("call_id") or "", content=_loaded_tools_text(item.get("tools"), registry))
+        ]
+    if item_type == "additional_tools":
+        # Codex sends its tools this way instead of in request.tools; they were registered
+        # up front and the item itself carries no conversation.
+        return []
     if item_type in IGNORED_INPUT_ITEM_TYPES:
         return []
     if item_type in (None, "message") or "role" in item:
@@ -189,60 +537,74 @@ def _convert_input_item(item: dict) -> list:
     return []
 
 
-def _convert_input(value: str | list[dict]) -> list:
+def _register_input_tools(value: str | list[dict], registry: ToolRegistry) -> None:
+    """Register the tools input items declare, before any history is replayed.
+
+    additional_tools come first, then tools loaded by tool_search_output, so a replayed call
+    maps onto the declared tool rather than onto a placeholder.
+    """
+    if isinstance(value, str):
+        return
+    items = [item for item in value if isinstance(item, dict)]
+    for item_type in ("additional_tools", "tool_search_output"):
+        for item in items:
+            if item.get("type") == item_type:
+                registry.add_loaded_tools(item.get("tools"))
+
+
+def _convert_input(value: str | list[dict], registry: ToolRegistry) -> list:
     if isinstance(value, str):
         return [UserMessage(content=value)] if value else []
 
     messages = []
     for item in value:
         if isinstance(item, dict):
-            messages.extend(_convert_input_item(item))
+            messages.extend(_convert_input_item(item, registry))
     return messages
 
 
-def _convert_tools(tools: list[dict] | None) -> list[Tool] | None:
-    if not tools:
-        return None
-
-    converted = []
-    for tool in tools:
-        if not isinstance(tool, dict):
-            continue
-        if tool.get("type") != "function":
-            # Hosted tools (web_search, file_search, computer_use, ...) run inside OpenAI
-            # and have no Bedrock counterpart.
-            logger.warning("Ignoring unsupported Responses tool of type %s", tool.get("type"))
-            continue
-        # Responses declares function tools flat; accept the nested Chat Completions shape too.
-        spec = tool["function"] if isinstance(tool.get("function"), dict) else tool
-        name = spec.get("name")
-        if not name:
-            continue
-        converted.append(
-            Tool(
-                function=Function(
-                    name=name,
-                    description=spec.get("description"),
-                    parameters=spec.get("parameters") or {"type": "object", "properties": {}},
-                )
-            )
-        )
-    return converted or None
+def _tool_choice_error(message: str) -> HTTPException:
+    return HTTPException(status_code=400, detail={"message": message, "param": "tool_choice"})
 
 
-def _convert_tool_choice(tool_choice: str | dict | None) -> str | dict:
-    if tool_choice is None:
+def _convert_tool_choice(tool_choice: str | dict | None, registry: ToolRegistry) -> str | dict:
+    """Map tool_choice onto the chat layer, rejecting a choice no declared tool can satisfy.
+
+    Bedrock would otherwise fail the call with a less helpful error, or (for "required"
+    with no tools) silently drop the constraint.
+    """
+    if tool_choice is None or tool_choice == "auto":
         return "auto"
     if isinstance(tool_choice, str):
         if tool_choice == "none":
             # Bedrock's toolChoice has no "none"; the closest behaviour is to let the model decide.
             logger.warning('tool_choice "none" is not supported by Bedrock, falling back to "auto"')
             return "auto"
-        return tool_choice
-    if tool_choice.get("type") == "function" and tool_choice.get("name"):
-        return {"function": {"name": tool_choice["name"]}}
-    if "function" in tool_choice:
-        return tool_choice
+        if tool_choice == "required":
+            if not registry.has_effective_tools:
+                raise _tool_choice_error('tool_choice "required" needs at least one supported tool in tools')
+            return "required"
+        logger.warning("Ignoring unsupported tool_choice %s", tool_choice)
+        return "auto"
+
+    # Responses names the tool flat; accept the nested Chat Completions shape too.
+    if tool_choice.get("type") == "function" or "function" in tool_choice:
+        spec = tool_choice["function"] if isinstance(tool_choice.get("function"), dict) else tool_choice
+        name = spec.get("name") or ""
+        namespace = spec.get("namespace")
+        entry = registry.resolve(namespace, name)
+        if entry is None or entry.kind != "function":
+            label = f"{namespace}.{name}" if namespace else name
+            raise _tool_choice_error(f"tool_choice names function {label!r}, which is not in tools")
+        return {"function": {"name": entry.bedrock_name}}
+    if tool_choice.get("type") == "custom":
+        name = tool_choice.get("name") or ""
+        namespace = tool_choice.get("namespace")
+        entry = registry.resolve(namespace, name)
+        if entry is None or entry.kind != "custom":
+            label = f"{namespace}.{name}" if namespace else name
+            raise _tool_choice_error(f"tool_choice names custom tool {label!r}, which is not in tools")
+        return {"function": {"name": entry.bedrock_name}}
     logger.warning("Ignoring unsupported tool_choice %s", tool_choice)
     return "auto"
 
@@ -263,16 +625,33 @@ class BedrockResponsesModel:
 
     def __init__(self, chat_model: BedrockModel | None = None):
         self.chat_model = chat_model or BedrockModel()
+        # The registry of the request last converted, so the response side can map tool
+        # uses back without converting the request twice.
+        self._registry: tuple[ResponsesRequest, ToolRegistry] | None = None
+
+    def _convert(self, request: ResponsesRequest) -> tuple[ToolRegistry, list]:
+        # Declared tools are registered before the input is replayed, so history naming a
+        # declared tool maps onto it rather than onto a placeholder.
+        registry = ToolRegistry.from_tools(request.tools)
+        _register_input_tools(request.input, registry)
+        messages = []
+        if request.instructions:
+            messages.append(SystemMessage(content=request.instructions))
+        messages.extend(_convert_input(request.input, registry))
+        self._registry = (request, registry)
+        return registry, messages
+
+    def _registry_for(self, request: ResponsesRequest) -> ToolRegistry:
+        if self._registry is not None and self._registry[0] is request:
+            return self._registry[1]
+        return self._convert(request)[0]
 
     def build_chat_request(self, request: ResponsesRequest) -> ChatRequest:
         """Convert and validate a Responses request. Raises HTTPException on bad input."""
         if DEBUG:
             logger.info("Raw Responses request: " + request.model_dump_json())
 
-        messages = []
-        if request.instructions:
-            messages.append(SystemMessage(content=request.instructions))
-        messages.extend(_convert_input(request.input))
+        registry, messages = self._convert(request)
 
         # instructions alone is not a conversation: Bedrock needs at least one message.
         if not any(message.role not in ("system", "developer") for message in messages):
@@ -301,8 +680,8 @@ class BedrockResponsesModel:
             top_p=request.top_p,
             max_tokens=max_tokens,
             reasoning_effort=reasoning_effort,
-            tools=_convert_tools(request.tools),
-            tool_choice=_convert_tool_choice(request.tool_choice),
+            tools=registry.chat_tools(),
+            tool_choice=_convert_tool_choice(request.tool_choice, registry),
             extra_body=request.extra_body,
         )
         self.chat_model.validate(chat_request)
@@ -323,7 +702,8 @@ class BedrockResponsesModel:
             temperature=request.temperature,
             text=request.text,
             tool_choice=request.tool_choice if request.tool_choice is not None else "auto",
-            tools=request.tools or [],
+            # Only what reached Bedrock, so a client can tell which tools were dropped.
+            tools=self._registry_for(request).effective_tools(),
             top_p=request.top_p,
             truncation=request.truncation or "disabled",
             metadata=request.metadata or {},
@@ -394,14 +774,16 @@ class BedrockResponsesModel:
                     status="completed",
                 )
             )
+        registry = self._registry_for(request)
         for tool_use in tool_calls:
             response.output.append(
-                ResponsesFunctionCall(
-                    id=generate_id("fc"),
-                    call_id=tool_use["toolUseId"],
-                    name=tool_use["name"],
-                    arguments=json.dumps(tool_use.get("input") or {}),
-                    status="completed",
+                _tool_call_item(
+                    registry,
+                    generate_id(ITEM_ID_PREFIX[_tool_kind(registry, tool_use["name"])]),
+                    tool_use["toolUseId"],
+                    tool_use["name"],
+                    json.dumps(tool_use.get("input") or {}),
+                    "completed",
                 )
             )
 
@@ -424,8 +806,10 @@ class BedrockResponsesModel:
         only be reported as a response.failed event rather than an HTTP error.
         """
         response_id = generate_id("resp")
-        session = _StreamSession(self._base_response(request, response_id, int(time.time())))
         chat_request = chat_request or self.build_chat_request(request)
+        session = _StreamSession(
+            self._base_response(request, response_id, int(time.time())), self._registry_for(request)
+        )
 
         # response.created has to come first: a client that sees any other event before it
         # has nothing to attach the rest of the stream to, and the OpenAI SDK errors out.
@@ -453,11 +837,59 @@ class BedrockResponsesModel:
                 yield event
 
 
+def _tool_kind(registry: ToolRegistry, bedrock_name: str) -> ToolKind:
+    entry = registry.lookup(bedrock_name)
+    return entry.kind if entry else "function"
+
+
+def _parse_arguments(arguments: str) -> dict:
+    """The toolUse input as an object; Bedrock's partial JSON only parses once complete."""
+    try:
+        value = json.loads(arguments or "{}")
+    except json.JSONDecodeError:
+        logger.warning("Tool input is not valid JSON: %s", arguments)
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _tool_call_item(
+    registry: ToolRegistry, item_id: str, call_id: str, bedrock_name: str, arguments: str, status: str
+) -> ResponsesFunctionCall | ResponsesCustomToolCall | ResponsesToolSearchCall:
+    """The output item for a Bedrock toolUse, typed and named the way the client declared the tool."""
+    entry = registry.lookup(bedrock_name)
+    if entry is not None and entry.kind == "custom":
+        value = _parse_arguments(arguments).get("input", "") if status == "completed" else ""
+        return ResponsesCustomToolCall(
+            id=item_id,
+            call_id=call_id,
+            name=entry.name,
+            namespace=entry.namespace,
+            input=value if isinstance(value, str) else json.dumps(value),
+            status=status,
+        )
+    if entry is not None and entry.kind == "tool_search":
+        return ResponsesToolSearchCall(
+            id=item_id,
+            call_id=call_id,
+            arguments=_parse_arguments(arguments) if status == "completed" else {},
+            status=status,
+        )
+    return ResponsesFunctionCall(
+        id=item_id,
+        call_id=call_id,
+        # A name Bedrock made up is passed through as is.
+        name=entry.name if entry else bedrock_name,
+        namespace=entry.namespace if entry else None,
+        arguments=arguments,
+        status=status,
+    )
+
+
 class _OpenBlock:
     """A Bedrock content block that is currently streaming, and the item it maps to."""
 
     def __init__(self, kind: str, output_index: int, item_id: str, call_id: str = "", name: str = ""):
-        self.kind = kind  # "text" | "reasoning" | "tool"
+        self.kind = kind  # "text" | "reasoning" | a ToolKind
         self.output_index = output_index
         self.item_id = item_id
         self.call_id = call_id
@@ -473,8 +905,9 @@ class _StreamSession:
     first delta arrives and closed on contentBlockStop.
     """
 
-    def __init__(self, response: ResponsesResponse):
+    def __init__(self, response: ResponsesResponse, registry: ToolRegistry | None = None):
         self.response = response
+        self.registry = registry or ToolRegistry()
         self.sequence_number = 0
         self.blocks: dict[int, _OpenBlock] = {}
         self.next_output_index = 0
@@ -497,11 +930,12 @@ class _StreamSession:
         if "contentBlockStart" in chunk:
             start = chunk["contentBlockStart"]["start"]
             if "toolUse" in start:
+                name = start["toolUse"]["name"]
                 return self._open(
                     chunk["contentBlockStart"]["contentBlockIndex"],
-                    "tool",
+                    _tool_kind(self.registry, name),
                     call_id=start["toolUse"]["toolUseId"],
-                    name=start["toolUse"]["name"],
+                    name=name,
                 )
             return []
 
@@ -607,12 +1041,16 @@ class _StreamSession:
                     },
                 )
             ]
-        return [
-            self.event(
-                "response.function_call_arguments.delta",
-                {"item_id": block.item_id, "output_index": block.output_index, "delta": text},
-            )
-        ]
+        if block.kind == "function":
+            return [
+                self.event(
+                    "response.function_call_arguments.delta",
+                    {"item_id": block.item_id, "output_index": block.output_index, "delta": text},
+                )
+            ]
+        # Custom and tool_search input arrives as JSON wrapping the real input, which only
+        # parses once complete, so it is buffered and sent with the finished item.
+        return []
 
     def _close(self, index: int) -> list[bytes]:
         block = self.blocks.pop(index, None)
@@ -667,7 +1105,7 @@ class _StreamSession:
                     },
                 )
             )
-        else:
+        elif block.kind == "function":
             events.append(
                 self.event(
                     "response.function_call_arguments.done",
@@ -678,6 +1116,13 @@ class _StreamSession:
                     },
                 )
             )
+        elif block.kind == "custom":
+            # The whole input as one delta (Codex previews apply_patch input from these),
+            # then the done event that closes the input.
+            payload = {"item_id": block.item_id, "output_index": block.output_index}
+            if item.input:
+                events.append(self.event("response.custom_tool_call_input.delta", {**payload, "delta": item.input}))
+            events.append(self.event("response.custom_tool_call_input.done", {**payload, "input": item.input}))
 
         self.response.output.append(item)
         events.append(
@@ -695,14 +1140,8 @@ class _StreamSession:
         if block.kind == "reasoning":
             summary = [ResponsesReasoningSummary(text=block.buffer)] if status == "completed" else []
             return ResponsesReasoningItem(id=block.item_id, summary=summary, status=status)
-        return ResponsesFunctionCall(
-            id=block.item_id,
-            call_id=block.call_id,
-            name=block.name,
-            # An empty argument string is valid on the wire but clients json.loads() it.
-            arguments=block.buffer or "{}",
-            status=status,
-        )
+        # An empty argument string is valid on the wire but clients json.loads() it.
+        return _tool_call_item(self.registry, block.item_id, block.call_id, block.name, block.buffer or "{}", status)
 
     def finish(self) -> list[bytes]:
         events = []

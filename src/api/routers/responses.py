@@ -5,6 +5,7 @@ from fastapi.responses import StreamingResponse
 
 from api.auth import api_key_auth
 from api.models.responses import BedrockResponsesModel
+from api.models.responses_native import NativeResponsesProxy, is_native_responses_model
 from api.schema import Error, ResponsesRequest, ResponsesResponse
 from api.setting import DEFAULT_MODEL
 
@@ -39,6 +40,11 @@ async def responses(
 ):
     if responses_request.model.lower().startswith("gpt-"):
         responses_request.model = DEFAULT_MODEL
+
+    # OpenAI models on Bedrock speak the Responses API natively, so their requests are
+    # forwarded untranslated and keep tools Converse cannot express (namespaces, tool_search).
+    if is_native_responses_model(responses_request.model):
+        return await NativeResponsesProxy().forward(responses_request)
 
     # Convert up front so a bad request still gets an HTTP error instead of a stream that
     # opens only to fail. Exception will be raised if model not supported.

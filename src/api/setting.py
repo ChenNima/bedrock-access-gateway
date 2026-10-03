@@ -43,3 +43,18 @@ ANTHROPIC_BETA_ALLOWLIST = frozenset(
     ).split(",")
     if beta.strip()
 )
+
+
+def parse_patterns(value: str) -> tuple[str, ...]:
+    return tuple(pattern.strip() for pattern in value.split(",") if pattern.strip())
+
+
+# Responses API requests for these models skip the Converse translation and go to Bedrock's
+# native OpenAI-compatible Responses endpoint, which keeps namespaces, tool_search and custom
+# tools intact. Comma-separated fnmatch globs, matched case-insensitively against the model id
+# after the gpt-* alias is resolved. An empty value disables the passthrough.
+RESPONSES_NATIVE_MODEL_PATTERNS = parse_patterns(os.environ.get("RESPONSES_NATIVE_MODEL_PATTERNS", "*openai.gpt-*"))
+# gpt-oss is served through Converse, not the native Responses endpoint.
+RESPONSES_NATIVE_EXCLUDE_PATTERNS = parse_patterns(os.environ.get("RESPONSES_NATIVE_EXCLUDE_PATTERNS", "*gpt-oss*"))
+# Defaults to https://bedrock-runtime.{AWS_REGION}.amazonaws.com/openai/v1/responses.
+BEDROCK_RUNTIME_RESPONSES_URL = os.environ.get("BEDROCK_RUNTIME_RESPONSES_URL", "") or None
