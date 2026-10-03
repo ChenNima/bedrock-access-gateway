@@ -1,7 +1,7 @@
 ---
 slug: responses-tool-protocol
 title: Responses API tool protocol (namespace, tool_search, native passthrough)
-status: active
+status: done
 created: 2026-10-03
 ---
 
