@@ -38,6 +38,40 @@ FUNCTION_CALL = {
     "arguments": "{}",
 }
 
+CLIENT_TOOL_SEARCH = {
+    "type": "tool_search",
+    "execution": "client",
+    "description": "Search deferred tools",
+    "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+}
+FUNCTION_TOOL = {
+    "type": "function",
+    "name": "get_weather",
+    "description": "Weather",
+    "strict": True,
+    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+    "defer_loading": True,
+}
+CUSTOM_TOOL = {
+    "type": "custom",
+    "name": "exec",
+    "description": "Run code",
+    "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"},
+}
+HOSTED_TOOLS = [
+    {"type": "web_search", "external_web_access": False},
+    {"type": "web_search_preview"},
+    {"type": "file_search", "vector_store_ids": ["vs_1"]},
+    {"type": "mcp", "server_label": "x", "server_url": "https://example.com/mcp"},
+    {"type": "code_interpreter", "container": {"type": "auto"}},
+    {"type": "image_generation"},
+    {"type": "local_shell"},
+    {"type": "computer_use_preview", "display_width": 1, "display_height": 1, "environment": "linux"},
+    {"type": "tool_search"},
+    {"type": "tool_search", "execution": "server"},
+    {"type": "some_future_hosted_tool"},
+]
+
 
 class FakeUpstream:
     def __init__(self, status_code=200, body=b"", chunks=None, content_type="application/json"):
@@ -129,7 +163,7 @@ def test_payload_keeps_client_fields():
         {
             "model": MODEL,
             "input": [{"role": "user", "content": "Check in."}, FUNCTION_CALL],
-            "tools": [NAMESPACE_TOOL, {"type": "tool_search"}],
+            "tools": [NAMESPACE_TOOL, CLIENT_TOOL_SEARCH],
             "tool_choice": "required",
             "prompt_cache_key": "abc",
             "client_metadata": {"x": 1},
@@ -138,7 +172,7 @@ def test_payload_keeps_client_fields():
     )
     payload = build_payload(request)
 
-    assert payload["tools"] == [NAMESPACE_TOOL, {"type": "tool_search"}]
+    assert payload["tools"] == [NAMESPACE_TOOL, CLIENT_TOOL_SEARCH]
     assert payload["tool_choice"] == "required"
     assert payload["input"][1] == FUNCTION_CALL
     assert payload["prompt_cache_key"] == "abc"
@@ -148,6 +182,94 @@ def test_payload_keeps_client_fields():
     # Fields the client left unset are not filled in with gateway defaults.
     assert "truncation" not in payload
     assert "parallel_tool_calls" not in payload
+
+
+def test_payload_drops_hosted_tools(caplog):
+    supported = [NAMESPACE_TOOL, FUNCTION_TOOL, CUSTOM_TOOL, CLIENT_TOOL_SEARCH]
+    tools = [HOSTED_TOOLS[0], *supported[:2], *HOSTED_TOOLS[1:], *supported[2:]]
+    request = ResponsesRequest.model_validate({"model": MODEL, "input": "Hi", "tools": tools})
+
+    with caplog.at_level("WARNING", logger=native_module.__name__):
+        payload = build_payload(request)
+
+    # Supported tools are forwarded in order and byte for byte.
+    assert json.dumps(payload["tools"]) == json.dumps(supported)
+    messages = " ".join(r.getMessage() for r in caplog.records if r.levelname == "WARNING")
+    for tool_type in ("web_search", "web_search_preview", "file_search", "mcp", "some_future_hosted_tool"):
+        assert f"type {tool_type}," in messages
+    assert "tool_search with execution server" in messages
+    assert "tool_search with execution None" in messages
+
+
+def test_payload_without_hosted_tools_is_unchanged():
+    tools = [NAMESPACE_TOOL, CUSTOM_TOOL, CLIENT_TOOL_SEARCH]
+    request = ResponsesRequest.model_validate(
+        {"model": MODEL, "input": "Hi", "tools": tools, "tool_choice": {"type": "function", "name": "get_weather"}}
+    )
+    payload = build_payload(request)
+    assert payload["tools"] == tools
+    assert payload["tool_choice"] == {"type": "function", "name": "get_weather"}
+
+
+def test_payload_drops_tools_field_when_only_hosted_tools():
+    request = ResponsesRequest.model_validate({"model": MODEL, "input": "Hi", "tools": [{"type": "web_search"}]})
+    assert "tools" not in build_payload(request)
+
+
+@pytest.mark.parametrize(
+    "tool_choice",
+    [
+        {"type": "web_search"},
+        {"type": "web_search_preview"},
+        {"type": "file_search"},
+        {"type": "mcp", "server_label": "x"},
+        {"type": "tool_search"},
+        {"type": "allowed_tools", "mode": "auto", "tools": [{"type": "web_search"}]},
+    ],
+)
+def test_tool_choice_naming_dropped_tool_becomes_auto(tool_choice, caplog):
+    tools = [NAMESPACE_TOOL, {"type": "web_search"}, {"type": "tool_search", "execution": "server"}]
+    request = ResponsesRequest.model_validate(
+        {"model": MODEL, "input": "Hi", "tools": tools, "tool_choice": tool_choice}
+    )
+    with caplog.at_level("WARNING", logger=native_module.__name__):
+        payload = build_payload(request)
+    assert payload["tool_choice"] == "auto"
+    assert payload["tools"] == [NAMESPACE_TOOL]
+    assert any("falling back to auto" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "tool_choice",
+    [
+        "required",
+        "none",
+        {"type": "function", "name": "chorus_checkin", "namespace": "mcp__chorus"},
+        {"type": "custom", "name": "exec"},
+        {"type": "tool_search"},
+        {"type": "allowed_tools", "mode": "required", "tools": [{"type": "function", "name": "chorus_checkin"}]},
+    ],
+)
+def test_tool_choice_for_kept_tools_is_unchanged(tool_choice):
+    tools = [NAMESPACE_TOOL, CUSTOM_TOOL, CLIENT_TOOL_SEARCH, {"type": "web_search"}]
+    request = ResponsesRequest.model_validate(
+        {"model": MODEL, "input": "Hi", "tools": tools, "tool_choice": tool_choice}
+    )
+    assert build_payload(request)["tool_choice"] == tool_choice
+
+
+def test_forwarded_request_has_no_hosted_tools(client, upstream):
+    response = client.post(
+        URL,
+        headers=AUTH,
+        json={
+            "model": MODEL,
+            "input": "Hi",
+            "tools": [NAMESPACE_TOOL, {"type": "web_search", "external_web_access": True}],
+        },
+    )
+    assert response.status_code == 200
+    assert upstream["body"]["tools"] == [NAMESPACE_TOOL]
 
 
 def test_payload_keeps_explicit_store():

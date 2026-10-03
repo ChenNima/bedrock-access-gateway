@@ -266,8 +266,12 @@ forwarded. A few points to know:
   gateway under your own role.
 - Bedrock's endpoint has its own limits: the model must be a `us.` / `global.` (or `us-gov.`)
   cross-Region profile, not a foundation-model id or an application inference profile.
-  `background: true` is rejected. Hosted tools such as `web_search` are not available, and
-  Guardrails do not apply. GPT OSS models do not support Responses on `bedrock-runtime`, which is
+  `background: true` is rejected, and Guardrails do not apply.
+- The endpoint runs no hosted tools and rejects a whole request that declares one, so the gateway
+  drops them on this path too, with a log warning. Only `function`, `namespace`, `custom` and
+  `tool_search` with `execution: "client"` tools are forwarded, unchanged. Everything else
+  (`web_search`, which Codex sends by default, `file_search`, `mcp`, `code_interpreter`, hosted
+  `tool_search`, ...) is removed. A `tool_choice` that names a removed tool falls back to `"auto"`. GPT OSS models do not support Responses on `bedrock-runtime`, which is
   why they are excluded and stay on the Converse path.
 
 | Setting | Default | Purpose |

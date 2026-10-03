@@ -242,8 +242,13 @@ Streaming events are relayed byte for byte, and upstream errors keep their statu
   yourself if you use your own role.
 - **Endpoint limits.** Name a `us.` / `global.` (or `us-gov.`) cross-Region inference profile.
   Foundation-model ids and application inference profiles are rejected, and so is
-  `background: true`. Hosted tools such as `web_search` are not available, and Guardrails do not
-  apply. GPT OSS models have no Responses support on `bedrock-runtime`, which is why they are
+  `background: true`. Guardrails do not apply.
+- **Hosted tools.** The endpoint runs no hosted tools and rejects a whole request that declares
+  one. The gateway therefore drops them here too, with a log warning: only `function`,
+  `namespace`, `custom` and `tool_search` with `execution: "client"` tools are forwarded, and
+  those unchanged. `web_search` (which Codex sends by default), `file_search`, `mcp`,
+  `code_interpreter`, hosted `tool_search` and any other type are removed, so Codex works without
+  `web_search = "disabled"`. A `tool_choice` that names a removed tool falls back to `"auto"`. GPT OSS models have no Responses support on `bedrock-runtime`, which is why they are
   excluded and stay on Converse.
 
 If you disable the passthrough, GPT-6 / GPT-5.x go through Converse. They reject the `temperature`

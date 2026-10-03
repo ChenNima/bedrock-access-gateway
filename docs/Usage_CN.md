@@ -236,9 +236,13 @@ Bedrock 在 `bedrock-runtime` 上通过自己的
   同时校验 `bedrock:InvokeModel`(或 `InvokeModelWithResponseStream`)。两个 CloudFormation 模板都已
   授予该权限;如果使用自己的角色,需要自行添加。
 - **端点限制。** 模型需填写 `us.` / `global.`(或 `us-gov.`)跨区域推理配置。基础模型 id 和
-  application inference profile 会被拒绝,`background: true` 也会被拒绝。`web_search` 等托管工具
-  不可用,Guardrails 也不生效。GPT OSS 模型在 `bedrock-runtime` 上不支持 Responses,因此被排除,
+  application inference profile 会被拒绝,`background: true` 也会被拒绝。Guardrails 不生效。GPT OSS 模型在 `bedrock-runtime` 上不支持 Responses,因此被排除,
   继续走 Converse。
+- **托管工具。** 该端点不执行任何托管工具,只要请求里声明了一个就会整体拒绝,所以网关在直通路径上
+  同样会丢弃它们并记录警告日志。只有 `function`、`namespace`、`custom` 以及 `execution: "client"`
+  的 `tool_search` 会被原样转发;`web_search`(Codex 默认会发送)、`file_search`、`mcp`、
+  `code_interpreter`、托管模式的 `tool_search` 以及其他任何类型都会被移除,因此 Codex 无需设置
+  `web_search = "disabled"`。如果 `tool_choice` 指向被移除的工具,则回退为 `"auto"`。
 
 如果关闭直通,GPT-6 / GPT-5.x 会走 Converse。它们不接受 `temperature` 字段,且返回的是加密的
 `redactedContent` 而非明文思考内容,因此网关会为它们丢弃 `temperature` 并跳过加密块。
