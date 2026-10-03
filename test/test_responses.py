@@ -413,3 +413,35 @@ async def test_response_echoes_the_request_settings():
     assert response.metadata == {"trace": "1"}
     assert response.reasoning.effort == "low"
     assert response.store is False
+
+
+def test_tool_history_without_tools_still_gets_a_tool_config(monkeypatch):
+    # Codex compacts context by summarising a tool-using history and sends no tools.
+    from api.models.bedrock import BedrockModel
+
+    model = BedrockModel()
+    monkeypatch.setattr(model, "_resolve_to_foundation_model", lambda model_id: model_id)
+    chat_request = build(
+        input=[
+            {"type": "message", "role": "user", "content": "list files"},
+            {"type": "function_call", "call_id": "call_1", "name": "shell", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "a.txt"},
+            {"type": "message", "role": "user", "content": "Summarize the conversation."},
+        ]
+    )
+
+    args = model._parse_request(chat_request)
+
+    assert [tool["toolSpec"]["name"] for tool in args["toolConfig"]["tools"]] == ["shell"]
+    assert "toolChoice" not in args["toolConfig"]
+
+
+def test_plain_history_without_tools_has_no_tool_config(monkeypatch):
+    from api.models.bedrock import BedrockModel
+
+    model = BedrockModel()
+    monkeypatch.setattr(model, "_resolve_to_foundation_model", lambda model_id: model_id)
+
+    args = model._parse_request(build(input="hello"))
+
+    assert "toolConfig" not in args

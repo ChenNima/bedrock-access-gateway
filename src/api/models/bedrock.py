@@ -906,6 +906,28 @@ class BedrockModel(BaseChatModel):
                         raise ValueError("tool_choice must contain 'function' key when specifying a specific tool")
                     tool_config["toolChoice"] = {"tool": {"name": chat_request.tool_choice["function"].get("name", "")}}
             args["toolConfig"] = tool_config
+        else:
+            # Converse refuses toolUse/toolResult blocks without a toolConfig, which OpenAI
+            # allows (e.g. Codex's compaction request summarises a tool-using history with no tools).
+            tool_names = [
+                part["toolUse"]["name"]
+                for message in messages
+                for part in message.get("content", [])
+                if "toolUse" in part
+            ]
+            if tool_names or any("toolResult" in part for m in messages for part in m.get("content", [])):
+                args["toolConfig"] = {
+                    "tools": [
+                        {
+                            "toolSpec": {
+                                "name": name,
+                                "description": "Tool used earlier in this conversation.",
+                                "inputSchema": {"json": {"type": "object", "properties": {}}},
+                            }
+                        }
+                        for name in dict.fromkeys(tool_names or ["tool"])
+                    ]
+                }
         # Add additional fields to enable extend thinking or other model-specific features
         if chat_request.extra_body:
             # Filter out prompt_caching (our control field, not for Bedrock)
