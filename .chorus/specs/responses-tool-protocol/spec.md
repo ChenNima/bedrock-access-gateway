@@ -15,7 +15,9 @@ model and come back intact. Nothing should be dropped silently.
 Requests for OpenAI GPT models on Bedrock (model id matching `*openai.gpt-*`, excluding gpt-oss)
 go to Bedrock's native Responses endpoint (`bedrock-runtime.<region>.amazonaws.com/openai/v1/responses`)
 unchanged and signed with SigV4. The patterns can be overridden through environment variables.
-The gateway adds `store=false` when the client did not set `store`. Streaming responses are
+The gateway adds `store=false` when the client did not set `store`. Hosted tool types that the native endpoint rejects (web_search, file_search, mcp, server-side
+tool_search, …) are dropped with a warning; only function, namespace, custom and client-mode
+tool_search tools are forwarded, and a tool_choice that names a dropped tool falls back to `auto`. Streaming responses are
 relayed byte-for-byte. Upstream error statuses and bodies are returned unchanged.
 
 All other models keep the Responses → Converse translation, which now:

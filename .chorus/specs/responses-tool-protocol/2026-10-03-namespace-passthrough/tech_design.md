@@ -35,6 +35,11 @@ POST /v1/responses
 - **Body.** `payload = request.model_dump(exclude_unset=True)`; with `extra="allow"`, unknown
   fields are kept. Drop `extra_body`. If `"store"` is not in `request.model_fields_set`, set
   `payload["store"] = False`. Write `payload["model"]` after aliasing.
+- **Hosted tools** (added after the first deploy, task 802b26d5). The native endpoint has no
+  server-side tools and rejects a whole request that carries one; Codex sends `web_search` by
+  default. `build_payload` keeps only an allowlist (`function`, `namespace`, `custom`, and
+  `tool_search` with `execution: "client"`). Every other tool is dropped with a warning, and a
+  `tool_choice` that names a dropped tool falls back to `auto`.
 - **Signing.** `botocore.auth.SigV4Auth(credentials, "bedrock", AWS_REGION)` signs a
   `botocore.awsrequest.AWSRequest`.
   - Credentials come from `boto3.Session().get_credentials().get_frozen_credentials()`,
