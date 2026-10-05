@@ -188,7 +188,8 @@ wire_api = "responses"
 ```
 
 关键是 `wire_api = "responses"`。把网关的 API Key 导出到 `BEDROCK_GATEWAY_API_KEY` 后直接运行
-`codex` 即可。Codex 会提示找不到该模型的 metadata,可以忽略。
+`codex` 即可。Codex 会提示找不到该模型的 metadata,可以忽略。当前的 Claude 模型可以直接使用 Codex
+默认的 reasoning effort(见 [Reasoning](#reasoning)),无需设置 `model_reasoning_effort = "none"`。
 
 Bedrock 上的 OpenAI 推理模型同样可用。把 `model` 指向它们的推理配置(inference profile)ID,
 并按需设置 `model_reasoning_effort`:
@@ -273,8 +274,10 @@ Codex CLI 那样在 `input` 中带上完整对话。回传到 `input` 里的 rea
 响应中的 `tools` 只回显请求 `tools` 里实际生效的声明。`tool_choice: "none"` 会退化为 `"auto"`,
 `allowed_tools` 会被忽略。
 
-当请求开启了 reasoning 但没给 `max_output_tokens` 时,网关必须补上 Bedrock 要求的 maxTokens,
-此时取 `DEFAULT_MAX_TOKENS`(默认 32768)。
+Claude 推理的处理方式见 [Reasoning](#reasoning):当前模型的 `reasoning.effort` 转为 adaptive thinking,
+较早的模型转为 `budget_tokens`。`minimal` 按 `low` 下发;`none` 不下发任何思考配置,由模型使用默认值。
+当请求开启了 reasoning 但没给 `max_output_tokens` 时,网关会补上 `DEFAULT_MAX_TOKENS`(默认 32768)
+作为 maxTokens,较早的 Claude 模型需要它来计算 budget。
 
 ## Anthropic Messages API
 
@@ -634,8 +637,12 @@ You can try it with different questions, such as:
 
 **重要**: 使用此 reasoning 推理模式前，请仔细阅读以下要点。
 
-- 目前仅 Claude 3.7 Sonnet / Deepseek R1 模型支持推理功能。使用前请确保所用模型支持推理。
-- Claude 3.7 Sonnet 推理模式（或思考模式）默认未启用，您必须在请求中传递额外的 reasoning_effort 参数，参数值可选:low，medium, high。另外，请在请求中提供正确的 max_tokens（或 max_completion_tokens）参数。budget_tokens 基于 reasoning_effort 设置（低：30%，中：60%，高：100% 的max tokens），确保最小 budget_tokens 为 1,024，Anthropic 建议至少使用 4,000 个令牌以获得全面的推理。详情请参阅 [Bedrock Document](https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-anthropic-claude-37.html)。
+- 目前 Claude（3.7 Sonnet 及之后的模型）、DeepSeek v3 和 Deepseek R1 支持推理功能。使用前请确保所用模型支持推理。
+- Claude 的推理模式（或思考模式）默认未启用，需要在请求中传递 reasoning_effort 参数，可选值为 low、medium、high。Responses API 的 `reasoning.effort` 用法相同。网关按模型下发不同的配置：
+  - **当前的 Claude 模型**（Opus 4.6 / Sonnet 4.6 及之后，包括 Claude 5 系列）使用 adaptive thinking：`thinking: {"type": "adaptive", "display": "summarized"}` 加 `output_config: {"effort": <reasoning_effort>}`，max_tokens 可以不填。这些模型不接受 `budget_tokens`。
+  - **较早的 Claude 模型**（Claude 3.x 含 3.7 Sonnet、Opus 4 / 4.1 / 4.5、Sonnet 4 / 4.5、Haiku 4.5）使用 budget_tokens，因此还需要在请求中提供正确的 max_tokens（或 max_completion_tokens）参数。budget_tokens 基于 reasoning_effort 设置（低：30%，中：60%，高：100% 的max tokens），确保最小 budget_tokens 为 1,024，Anthropic 建议至少使用 4,000 个令牌以获得全面的推理。详情请参阅 [Bedrock Document](https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-anthropic-claude-37.html)。
+  - 较早模型的名单由环境变量 `BUDGET_THINKING_MODEL_PATTERNS` 控制：逗号分隔、不区分大小写的 glob 模式，匹配推理配置解析后的基础模型 id。设置该变量会整体替换内置名单。名单之外的 Claude 模型一律使用 adaptive thinking。
+- 从 Opus 4.7 起的 Claude 模型（较早名单和 Opus 4.6 / Sonnet 4.6 之外的所有 Claude 模型）不接受 `temperature` 和 `top_p`，网关会为这些模型丢弃这两个参数。开启思考时，所有 Claude 模型的 `top_p` 都会被丢弃。
 - Deepseek R1 会自动使用推理模式，不需要在中传递额外的 reasoning_effort 参数（否则会报错）
 - 推理结果（思维链结果、思考过程）被添加到名为 'reasoning_content' 的额外标签中，这不是 OpenAI 官方支持的格式。此设计遵循 [Deepseek Reasoning Model](https://api-docs.deepseek.com/guides/reasoning_model#api-example)  的规范。未来可能会有所变动。
 

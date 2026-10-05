@@ -228,7 +228,8 @@ wire_api = "responses"
 
 Then `export BEDROCK_GATEWAY_API_KEY=<API key>` and run `codex`. Shell commands, file edits and
 reasoning summaries all work; Codex will warn that it has no metadata for the model, which is
-harmless.
+harmless. Codex's default reasoning effort works with current Claude models too, so there is no
+need to set `model_reasoning_effort = "none"`.
 
 OpenAI GPT models on Bedrock work as well — set `model` to their inference-profile ID, e.g.
 `global.openai.gpt-6-astra` or `global.openai.gpt-5.6-sol`, and optionally add
@@ -295,7 +296,7 @@ All other models are translated to Bedrock Converse. What the translation covers
 | `additional_tools` input items | Their tools are added to the request's tool list. |
 | `custom` tools (e.g. Codex's grammar-based `exec`) | Sent as a function that takes a single string `input`. Calls come back as `custom_tool_call` items. The grammar is written into the tool description, because Bedrock cannot enforce it. |
 | Hosted tools (`web_search`, `file_search`, ...) | Dropped with a log warning, since they have no Bedrock counterpart. The response's `tools` echoes only the declarations from the request's `tools` that took effect, and a namespace keeps only its accepted members. |
-| `reasoning` | Emitted as reasoning items with summary text. Set `DEFAULT_MAX_TOKENS` if you need a budget other than 32,768 when a request omits `max_output_tokens`. |
+| `reasoning` | `effort` becomes adaptive thinking (`output_config.effort`) on current Claude models, or a `budget_tokens` on the older ones listed in `BUDGET_THINKING_MODEL_PATTERNS` (see [Reasoning](./docs/Usage.md#reasoning)). `minimal` is sent as `low`, and `none` sends no thinking configuration. Emitted as reasoning items with summary text. Set `DEFAULT_MAX_TOKENS` if you need a cap other than 32,768 when a request omits `max_output_tokens`. |
 | `store`, `previous_response_id` | Ignored. The gateway is stateless, so send the full conversation in `input` (which is what the Codex CLI does). |
 | Input `reasoning` items | Dropped. Bedrock only accepts a reasoning block back with the signature it issued, and that signature has no place in the Responses wire format. |
 

@@ -1,4 +1,5 @@
 import base64
+import fnmatch
 import json
 import logging
 import time
@@ -43,6 +44,7 @@ from api.schema import (
 )
 from api.setting import (
     AWS_REGION,
+    BUDGET_THINKING_MODEL_PATTERNS,
     DEBUG,
     DEFAULT_MODEL,
     ENABLE_CROSS_REGION_INFERENCE,
@@ -107,6 +109,28 @@ TEMPERATURE_UNSUPPORTED_MODELS = {
     "openai.gpt-6",
     "openai.gpt-5",
 }
+
+# Adaptive-thinking Claude models that still accept temperature and top_p. Every other
+# Claude model outside BUDGET_THINKING_MODEL_PATTERNS rejects them with a ValidationException.
+SAMPLING_SUPPORTED_ADAPTIVE_MODELS = {
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+}
+
+
+def uses_budget_thinking(model_lower: str) -> bool:
+    """Whether a Claude model takes reasoning_config with budget_tokens instead of adaptive thinking."""
+    return any(fnmatch.fnmatchcase(model_lower, p.lower()) for p in BUDGET_THINKING_MODEL_PATTERNS)
+
+
+def rejects_sampling_params(model_lower: str) -> bool:
+    """Whether a model rejects the temperature and topP inference parameters."""
+    return (
+        "anthropic.claude" in model_lower
+        and not uses_budget_thinking(model_lower)
+        and not any(m in model_lower for m in SAMPLING_SUPPORTED_ADAPTIVE_MODELS)
+    )
+
 
 # Smallest reasoning budget Bedrock accepts today. It may differ per model in the future.
 MIN_BUDGET_TOKENS = 1024
@@ -832,6 +856,12 @@ class BedrockModel(BaseChatModel):
             if DEBUG:
                 logger.info(f"Removed temperature for {chat_request.model} (not supported by model)")
 
+        # Claude models from Opus 4.7 on reject sampling parameters outright.
+        if rejects_sampling_params(model_lower):
+            for field in ("temperature", "topP"):
+                if inference_config.pop(field, None) is not None and DEBUG:
+                    logger.info(f"Removed {field} for {chat_request.model} (not supported by model)")
+
         # Check if model is in the conflict list and both parameters are present
         if "temperature" in inference_config and "topP" in inference_config:
             if any(conflict_model in model_lower for conflict_model in TEMPERATURE_TOPP_CONFLICT_MODELS):
@@ -858,8 +888,17 @@ class BedrockModel(BaseChatModel):
             resolved_model = self._resolve_to_foundation_model(chat_request.model)
             model_lower = resolved_model.lower()
 
-            if "anthropic.claude" in model_lower:
-                # Claude format: reasoning_config = object with budget_tokens
+            if "anthropic.claude" in model_lower and not uses_budget_thinking(model_lower):
+                # Current Claude models reject budget_tokens: they think adaptively and take the
+                # effort level directly. "summarized" returns readable reasoning text; these
+                # models otherwise default to "omitted" and stream empty thinking blocks.
+                inference_config.pop("topP", None)
+                args["additionalModelRequestFields"] = {
+                    "thinking": {"type": "adaptive", "display": "summarized"},
+                    "output_config": {"effort": chat_request.reasoning_effort},
+                }
+            elif "anthropic.claude" in model_lower:
+                # Older Claude format: reasoning_config = object with budget_tokens
                 if effective_max_tokens is None:
                     raise HTTPException(
                         status_code=400,

@@ -669,7 +669,8 @@ class BedrockResponsesModel:
 
         max_tokens = request.max_output_tokens
         if reasoning_effort and max_tokens is None:
-            # Claude rejects an enabled reasoning_config without maxTokens.
+            # Older Claude models derive the reasoning budget from maxTokens and reject a
+            # reasoning_config without it. Adaptive-thinking models just get the default cap.
             max_tokens = DEFAULT_MAX_TOKENS
 
         chat_request = ChatRequest(

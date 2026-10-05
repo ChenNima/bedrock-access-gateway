@@ -56,5 +56,17 @@ def parse_patterns(value: str) -> tuple[str, ...]:
 RESPONSES_NATIVE_MODEL_PATTERNS = parse_patterns(os.environ.get("RESPONSES_NATIVE_MODEL_PATTERNS", "*openai.gpt-*"))
 # gpt-oss is served through Converse, not the native Responses endpoint.
 RESPONSES_NATIVE_EXCLUDE_PATTERNS = parse_patterns(os.environ.get("RESPONSES_NATIVE_EXCLUDE_PATTERNS", "*gpt-oss*"))
+# Claude models that predate adaptive thinking. A reasoning effort turns into
+# reasoning_config with a budget_tokens for these; every other Claude model gets adaptive
+# thinking plus output_config.effort. Comma-separated fnmatch globs, matched
+# case-insensitively against the foundation model id. Setting the variable replaces the list.
+BUDGET_THINKING_MODEL_PATTERNS = parse_patterns(
+    os.environ.get(
+        "BUDGET_THINKING_MODEL_PATTERNS",
+        "*anthropic.claude-v2*,*anthropic.claude-instant*,*anthropic.claude-3-*,"
+        "*anthropic.claude-opus-4-2025*,*anthropic.claude-opus-4-1*,*anthropic.claude-opus-4-5*,"
+        "*anthropic.claude-sonnet-4-2025*,*anthropic.claude-sonnet-4-5*,*anthropic.claude-haiku-4-5*",
+    )
+)
 # Defaults to https://bedrock-runtime.{AWS_REGION}.amazonaws.com/openai/v1/responses.
 BEDROCK_RUNTIME_RESPONSES_URL = os.environ.get("BEDROCK_RUNTIME_RESPONSES_URL", "") or None

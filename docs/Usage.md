@@ -190,6 +190,8 @@ wire_api = "responses"
 
 `wire_api = "responses"` is the important part. Export `BEDROCK_GATEWAY_API_KEY` with your gateway
 API key and run `codex`. Codex will warn that it has no metadata for the model, which is harmless.
+Codex's default reasoning effort works with current Claude models (see [Reasoning](#reasoning)), so
+there is no need to set `model_reasoning_effort = "none"`.
 
 OpenAI reasoning models on Bedrock work too. Point `model` at their inference-profile ID and,
 optionally, set `model_reasoning_effort`:
@@ -288,8 +290,11 @@ having no Bedrock counterpart. The response's `tools` echoes only the declaratio
 request's `tools` that took effect. `tool_choice: "none"` falls back to `"auto"`, and
 `allowed_tools` is ignored.
 
-When a request enables reasoning without `max_output_tokens`, the gateway has to supply the
-maxTokens that Bedrock requires; it uses `DEFAULT_MAX_TOKENS` (32,768 by default).
+Claude reasoning works as described in [Reasoning](#reasoning): `reasoning.effort` becomes adaptive
+thinking on current models and a `budget_tokens` on older ones. `minimal` is sent as `low`, and
+`none` sends no thinking configuration, so the model uses its default. When a request enables
+reasoning without `max_output_tokens`, the gateway supplies `DEFAULT_MAX_TOKENS` (32,768 by
+default) as maxTokens, which older Claude models need to derive the budget.
 
 ## Anthropic Messages API
 
@@ -656,8 +661,12 @@ You can try it with different questions, such as:
 ## Reasoning
 
 **Important Notice**: Please carefully review the following points before using reasoning mode for Chat completion API.
-- Only Claude 3.7 Sonnet (extended thinking) and DeepSeek R1 support Reasoning so far. Please make sure the model supports reasoning before use.
-- For Claude 3.7 Sonnet, the reasoning mode (or thinking mode) is not enabled by default, you must pass additional `reasoning_effort` parameter in your request. Please also provide the right max_tokens (or max_completion_tokens) in your request. The budget_tokens is based on reasoning_effort (low: 30%, medium: 60%, high: 100% of max tokens), ensuring minimum budget_tokens of 1,024 with Anthropic recommending at least 4,000 tokens for comprehensive reasoning. Check [Bedrock Document](https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-anthropic-claude-37.html) for more details.
+- Reasoning is supported for Claude models (3.7 Sonnet and later), DeepSeek v3 and DeepSeek R1. Please make sure the model supports reasoning before use.
+- For Claude, the reasoning mode (or thinking mode) is not enabled by default; pass `reasoning_effort` (`low`, `medium` or `high`) in your request. The Responses API's `reasoning.effort` works the same way. How the effort is sent depends on the model:
+  - **Current Claude models** (Opus 4.6 / Sonnet 4.6 and later, including the Claude 5 family) get adaptive thinking: `thinking: {"type": "adaptive", "display": "summarized"}` plus `output_config: {"effort": <reasoning_effort>}`. `max_tokens` is optional. These models reject `budget_tokens`.
+  - **Older Claude models** (Claude 3.x including 3.7 Sonnet, Opus 4 / 4.1 / 4.5, Sonnet 4 / 4.5 and Haiku 4.5) get a `budget_tokens`, so you must also provide the right max_tokens (or max_completion_tokens). The budget_tokens is based on reasoning_effort (low: 30%, medium: 60%, high: 100% of max tokens), ensuring minimum budget_tokens of 1,024 with Anthropic recommending at least 4,000 tokens for comprehensive reasoning. Check [Bedrock Document](https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-anthropic-claude-37.html) for more details.
+  - The older list is the `BUDGET_THINKING_MODEL_PATTERNS` environment variable: comma-separated, case-insensitive glob patterns matched against the foundation model id (inference profiles are resolved first). Setting it replaces the built-in list. Any Claude model it does not match gets adaptive thinking.
+- Claude models from Opus 4.7 on (everything outside the older list except Opus 4.6 / Sonnet 4.6) reject `temperature` and `top_p`, so the gateway drops them for those models. With thinking on, `top_p` is dropped for every Claude model.
 - For DeepSeek R1, you don't need additional reasoning_effort parameter, otherwise, you may get an error.
 - The reasoning response (CoT, thoughts) is added in an additional tag 'reasoning_content' which is not officially supported by OpenAI. This is to follow [Deepseek Reasoning Model](https://api-docs.deepseek.com/guides/reasoning_model#api-example). This may be changed in the future.
 
