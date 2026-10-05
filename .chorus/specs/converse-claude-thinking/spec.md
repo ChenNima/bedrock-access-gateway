@@ -1,7 +1,7 @@
 ---
 slug: converse-claude-thinking
 title: Claude reasoning mapping on the Converse translation path
-status: active
+status: done
 created: 2026-10-05
 ---
 
@@ -25,10 +25,10 @@ no thinking configuration at all. Adaptive models do not need max_tokens.
 Claude models outside the legacy list and outside Opus 4.6 / Sonnet 4.6 reject sampling
 parameters, so the gateway drops `temperature` and `topP` for them whether or not reasoning is on.
 
-- [ ] claude-opus-5 / claude-sonnet-5-5 accept reasoning effort on Chat Completions and Responses and return reasoning text
-- [ ] legacy Claude models keep enabled + budget_tokens unchanged
-- [ ] temperature / topP never reach a Claude model that rejects them
-- [ ] Codex 0.160.0 with default reasoning completes a native mcp_tool_call through the Tokyo gateway on claude-opus-5
+- [x] claude-opus-5 / claude-sonnet-5-5 accept reasoning effort on Chat Completions and Responses and return reasoning text
+- [x] legacy Claude models keep enabled + budget_tokens unchanged
+- [x] temperature / topP never reach a Claude model that rejects them
+- [x] Codex 0.160.0 with default reasoning completes a native mcp_tool_call through the Tokyo gateway on claude-opus-5
 
 ## Non-goals
 - Exposing `xhigh` / `max` effort levels.
